@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Campaigns · Atlas SDR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<!-- Icon sprite: reference with <svg class="icon"><use href="#i-name"/></svg> -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-campaigns" viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4V5Z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m20 20-4-4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8.5 5v14M15.5 5v14" stroke-width="2.6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5v14l11-7L7 5Z"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-compare" viewBox="0 0 24 24"><path d="M6 20V10M12 20V4M18 20v-7"/></symbol>
+</svg>
+
+<div class="shell">
+
+  <!-- ===== Sidebar (identical on every page; change aria-current per page) ===== -->
+  <aside class="sidebar">
+    <div class="sidebar__top">
+      <div class="brand">
+        <svg class="brand__mark" viewBox="0 0 28 28" aria-hidden="true">
+          <rect width="28" height="28" rx="8" fill="#3446d6"/>
+          <rect x="6" y="8" width="16" height="3" rx="1.5" fill="#fff"/>
+          <rect x="8.5" y="13.5" width="11" height="3" rx="1.5" fill="#fff"/>
+          <rect x="11" y="19" width="6" height="3" rx="1.5" fill="#fff"/>
+        </svg>
+        <div>
+          <div class="brand__name">Atlas SDR</div>
+          <div class="brand__sub">Control plane</div>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Main">
+        <a class="nav__link" href="campaigns.html" aria-current="page">
+          <svg class="icon nav__icon"><use href="#i-campaigns"/></svg>Campaigns
+        </a>
+        <a class="nav__link" href="conversations.html">
+          <svg class="icon nav__icon"><use href="#i-inbox"/></svg>Conversations
+          <span class="nav__badge" data-badge="approvals" aria-label="pending approvals"></span>
+        </a>
+        <a class="nav__link" href="settings.html">
+          <svg class="icon nav__icon"><use href="#i-settings"/></svg>Global settings
+        </a>
+      </nav>
+    </div>
+
+    <!-- Global kill switch: wired up by js/shell.js on every page -->
+    <div class="ks" data-killswitch>
+      <div class="ks__title" data-ks-title>Global kill switch</div>
+      <p class="ks__text" data-ks-text>Stops every agent on every campaign and channel.</p>
+      <button type="button" class="btn btn--danger btn--sm" data-ks-button>Stop all activity</button>
+    </div>
+  </aside>
+
+  <!-- ===== Main ===== -->
+  <div class="main">
+    <header class="topbar">
+      <h1>Campaigns</h1>
+      <div class="topbar__actions">
+        <label class="search">
+          <span class="sr-only">Search campaigns</span>
+          <svg class="icon"><use href="#i-search"/></svg>
+          <input class="input" type="search" id="search" placeholder="Search campaigns" autocomplete="off">
+        </label>
+        <a class="btn btn--primary" href="campaign-new.html" id="new-campaign">
+          <svg class="icon"><use href="#i-plus"/></svg>New campaign
+        </a>
+        <span class="avatar" data-user-avatar title="Signed in" aria-hidden="true"></span>
+      </div>
+    </header>
+
+    <main class="content" id="content">
+
+      <!-- Filled by shell.js when the global kill switch is on -->
+      <div data-slot="platform-banner"></div>
+
+      <!-- Summary strip: GET /campaigns/summary -->
+      <section class="metrics" aria-label="Summary" id="metrics">
+        <div class="metric">
+          <div class="metric__label">Live campaigns</div>
+          <div class="metric__value" data-metric="live">–</div>
+          <div class="metric__note" data-metric-note="live"></div>
+        </div>
+        <div class="metric">
+          <div class="metric__label">Prospects in motion</div>
+          <div class="metric__value" data-metric="prospects">–</div>
+          <div class="metric__note" data-metric-note="prospects"></div>
+        </div>
+        <div class="metric">
+          <div class="metric__label">Meetings booked, last 30 days</div>
+          <div class="metric__value" data-metric="meetings">–</div>
+          <div class="metric__note" data-metric-note="meetings"></div>
+        </div>
+        <a class="metric" href="conversations.html?filter=approvals" id="metric-approvals">
+          <div class="metric__label">Waiting for your approval</div>
+          <div class="metric__value" data-metric="approvals">–</div>
+          <div class="metric__note" data-metric-note="approvals"></div>
+        </a>
+      </section>
+
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <div class="filters" id="filters" role="group" aria-label="Filter by status"></div>
+        <div class="toolbar__group">
+          <label class="sr-only" for="owner-filter">Owner</label>
+          <select class="select" id="owner-filter"><option value="all">All owners</option></select>
+          <label class="sr-only" for="sort">Sort by</label>
+          <select class="select" id="sort">
+            <option value="created">Sort: date created</option>
+            <option value="meetings">Sort: most meetings</option>
+            <option value="name">Sort: name</option>
+          </select>
+          <a class="btn btn--secondary btn--sm" id="compare" href="#" aria-disabled="true"
+             title="Select two or more campaigns to compare">
+            <svg class="icon"><use href="#i-compare"/></svg><span id="compare-label">Compare</span>
+          </a>
+        </div>
+      </div>
+
+      <!-- Campaign list: GET /campaigns -->
+      <section class="panel" aria-labelledby="list-title">
+        <div class="table-wrap">
+          <table class="ctable">
+            <caption class="sr-only" id="list-title">All campaigns</caption>
+            <thead>
+              <tr>
+                <th class="c-select"><span class="sr-only">Select</span></th>
+                <th>Campaign</th>
+                <th>Status</th>
+                <th>Channels</th>
+                <th class="num">Prospects</th>
+                <th class="num">Outreach</th>
+                <th class="num">Meetings</th>
+                <th>Owner</th>
+                <th class="c-actions"><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="campaign-rows"></tbody>
+          </table>
+        </div>
+        <div id="list-state" aria-live="polite"></div>
+      </section>
+
+      <!-- Needs attention + recent activity: GET /approvals, GET /events -->
+      <div class="split">
+        <section class="panel" aria-labelledby="approvals-title">
+          <div class="panel__head">
+            <div>
+              <h2 id="approvals-title">Waiting for your approval <span class="count" id="approvals-count" hidden></span></h2>
+              <div class="panel__sub">Agents stopped here because a rule needs a human.</div>
+            </div>
+          </div>
+          <ul id="approvals-list"></ul>
+        </section>
+
+        <section class="panel" aria-labelledby="events-title">
+          <div class="panel__head">
+            <div>
+              <h2 id="events-title">Recent activity</h2>
+              <div class="panel__sub">Changes across all campaigns.</div>
+            </div>
+          </div>
+          <ul id="events-list"></ul>
+        </section>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<!-- Row action menu (single instance, positioned by campaigns.js) -->
+<div class="menu" id="row-menu" role="menu" hidden></div>
+
+<!-- Script order matters: config, mock, api, shell, page -->
+<script src="js/config.js" defer></script>
+<script src="js/mock-data.js" defer></script>
+<script src="js/api.js" defer></script>
+<script src="js/shell.js" defer></script>
+<script src="js/campaigns.js" defer></script>
+</body>
+</html>
