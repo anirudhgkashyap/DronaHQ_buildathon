@@ -1,0 +1,410 @@
+"""Platform-wide state: identity, activity feed, kill switch, scheduler,
+integrations, the do-not-contact list, representatives, and inbound webhooks.
+
+The theme of this router is *operational control*. Everything here answers one
+of two questions a manager asks when something looks wrong: "what has the
+system been doing?" (events, scheduler) and "how do I make it stop?" (kill
+switch, suppression, channel and campaign pauses live next door).
+"""
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal, Optional
+
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import func, or_, select
+
+from .. import audit
+from ..config import settings
+from ..db import new_id
+from ..models import AuditLog, Campaign, Prospect, SuppressionEntry, User, utcnow
+from ..orchestrator import scheduler
+from ..orchestrator.engine import handle_inbound
+from ..orchestrator.guardrails import get_kill_switch, set_kill_switch
+from ..rag.embedder import EMBEDDER_NAME
+from ..serializers import iso, serialize_event, serialize_user
+from .deps import SessionDep, UserDep, actor, clamp, load_prospect, step_json
+from .errors import invalid_request, not_found
+
+router = APIRouter(tags=["platform"])
+
+ChannelType = Literal["linkedin", "email", "voice", "sms", "whatsapp"]
+
+
+# ---------------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------------
+class KillSwitchRequest(BaseModel):
+    engaged: bool
+
+
+class SuppressionCreate(BaseModel):
+    """At least one identifier is required: an entry that matches nothing is a
+    silent no-op, and a do-not-contact list that silently does nothing is the
+    most dangerous object in the system."""
+
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    domain: Optional[str] = None
+    reason: str = Field(default="manual", max_length=120)
+    scope: Literal["global", "campaign"] = "global"
+    campaign_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _needs_an_identifier(self) -> "SuppressionCreate":
+        if not any([self.email, self.phone, self.linkedin_url, self.domain]):
+            raise ValueError(
+                "needs at least one of email, phone, LinkedIn URL or company domain"
+            )
+        if self.scope == "campaign" and not self.campaign_id:
+            raise ValueError("needs a campaign when the scope is limited to one campaign")
+        return self
+
+
+class UserCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    initials: Optional[str] = Field(default=None, max_length=8)
+    email: Optional[str] = None
+    role: Literal["manager", "rep", "admin"] = "rep"
+    daily_activity_limit: int = Field(default=100, ge=0, le=10_000)
+    channels_available: list[ChannelType] = Field(default_factory=lambda: ["email", "linkedin"])
+    working_hours: Optional[dict[str, Any]] = None
+
+
+class InboundWebhook(BaseModel):
+    channel: ChannelType
+    body: str = Field(min_length=1)
+    campaign_id: Optional[str] = None
+    prospect_id: Optional[str] = None
+    email: Optional[str] = None
+    external_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _identifies_someone(self) -> "InboundWebhook":
+        if not (self.prospect_id or self.email):
+            raise ValueError("must name either a prospect or the email address that replied")
+        return self
+
+
+def serialize_suppression(entry: SuppressionEntry) -> dict:
+    return {
+        "id": entry.id,
+        "email": entry.email,
+        "phone": entry.phone,
+        "linkedin_url": entry.linkedin_url,
+        "domain": entry.domain,
+        "reason": entry.reason,
+        "scope": entry.scope,
+        "campaign_id": entry.campaign_id,
+        "created_at": iso(entry.created_at),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Identity and activity
+# ---------------------------------------------------------------------------
+@router.get("/me")
+async def me(user: UserDep) -> dict:
+    """The signed-in user. Drives the avatar in the top bar."""
+    return serialize_user(user)
+
+
+@router.get("/events")
+async def list_events(
+    session: SessionDep,
+    _: UserDep,
+    limit: Annotated[Optional[int], Query(ge=1, le=200)] = 5,
+    campaign_id: Annotated[Optional[str], Query()] = None,
+) -> dict:
+    """The activity feed, newest first.
+
+    Straight off the append-only audit log, which is deliberate: the feed and
+    the evidence trail are the same data, so what a manager sees on the page is
+    exactly what an auditor would see in the table.
+    """
+    stmt = select(AuditLog).order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+    if campaign_id:
+        stmt = stmt.where(AuditLog.campaign_id == campaign_id)
+    entries = (await session.execute(stmt.limit(clamp(limit, 5, 200)))).scalars().all()
+    return {"items": [serialize_event(entry) for entry in entries]}
+
+
+# ---------------------------------------------------------------------------
+# Kill switch
+# ---------------------------------------------------------------------------
+@router.get("/platform/kill-switch")
+async def read_kill_switch(session: SessionDep, _: UserDep) -> dict:
+    return await get_kill_switch(session)
+
+
+@router.put("/platform/kill-switch")
+async def write_kill_switch(
+    body: KillSwitchRequest, session: SessionDep, user: UserDep
+) -> dict:
+    """Stop, or restart, every autonomous external action platform-wide.
+
+    Campaign statuses are untouched on purpose: engaging the switch is an
+    emergency brake, not a reconfiguration, and releasing it must put the
+    platform back exactly as it was without a manager re-activating twenty
+    campaigns by hand.
+    """
+    state = await set_kill_switch(
+        session, engaged=body.engaged, actor={"id": user.id, "name": user.name}
+    )
+
+    message = (
+        f"Global kill switch engaged by {actor(user)}. "
+        "All autonomous execution halted platform-wide."
+        if body.engaged
+        else f"Global kill switch released by {actor(user)}. Campaigns resume on their own status."
+    )
+    await audit.record(
+        session,
+        entity_type="platform",
+        entity_id="kill_switch",
+        event_type="kill_switch_engaged" if body.engaged else "kill_switch_released",
+        severity="error" if body.engaged else "success",
+        message=message,
+        actor=actor(user),
+        payload={"engaged": body.engaged},
+    )
+    await session.commit()
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+@router.get("/platform/scheduler")
+async def scheduler_state(_: UserDep) -> dict:
+    """Whether the autonomous loop is actually running, and what it last did."""
+    return scheduler.state.as_dict()
+
+
+@router.post("/platform/scheduler/tick")
+async def scheduler_tick(_: UserDep) -> dict:
+    """Force one pass over every live campaign.
+
+    Runs in its own session (``scheduler.run_once`` opens one and commits per
+    campaign), so a single campaign blowing up cannot roll back the work the
+    others already did.
+    """
+    return await scheduler.run_once()
+
+
+# ---------------------------------------------------------------------------
+# Integrations
+# ---------------------------------------------------------------------------
+@router.get("/platform/settings")
+async def platform_settings(_: UserDep) -> dict:
+    """Which integrations are wired up, as booleans only.
+
+    Never returns a key, a token or a fragment of one. "Is SendGrid
+    configured?" is the only question the UI needs answered, and it is the only
+    question that can be answered without creating a way to exfiltrate secrets
+    through the API.
+    """
+    return {
+        "dronahq_configured": settings.dronahq_enabled,
+        "openai_configured": bool(settings.OPENAI_API_KEY),
+        "sendgrid_configured": bool(settings.SENDGRID_API_KEY),
+        "twilio_configured": bool(settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN),
+        "channels_dry_run": settings.CHANNELS_DRY_RUN,
+        "embedder": EMBEDDER_NAME,
+        "agent_executor": "dronahq" if settings.dronahq_enabled else "simulator",
+        "database": "postgres" if settings.is_postgres else "sqlite",
+        "scheduler_enabled": settings.SCHEDULER_ENABLED,
+        "scheduler_tick_seconds": settings.SCHEDULER_TICK_SECONDS,
+        "environment": settings.ENV,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Suppression list
+# ---------------------------------------------------------------------------
+@router.get("/platform/suppression")
+async def list_suppression(
+    session: SessionDep,
+    _: UserDep,
+    q: Annotated[Optional[str], Query()] = None,
+    limit: Annotated[Optional[int], Query(ge=1, le=500)] = 100,
+) -> dict:
+    stmt = select(SuppressionEntry).order_by(SuppressionEntry.created_at.desc())
+    if q:
+        needle = f"%{q.strip().lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(SuppressionEntry.email).like(needle),
+                func.lower(SuppressionEntry.domain).like(needle),
+                func.lower(SuppressionEntry.linkedin_url).like(needle),
+                SuppressionEntry.phone.like(needle),
+            )
+        )
+    total = int(
+        (await session.execute(select(func.count(SuppressionEntry.id)))).scalar() or 0
+    )
+    entries = (await session.execute(stmt.limit(clamp(limit, 100, 500)))).scalars().all()
+    return {"items": [serialize_suppression(e) for e in entries], "total": total}
+
+
+@router.post("/platform/suppression", status_code=201)
+async def add_suppression(
+    body: SuppressionCreate, session: SessionDep, user: UserDep
+) -> dict:
+    """Add a do-not-contact entry. Takes effect on the very next guardrail
+    check, which is before every outbound message on every channel."""
+    entry = SuppressionEntry(
+        id=new_id("sup"),
+        email=(body.email or "").strip().lower() or None,
+        phone=(body.phone or "").strip() or None,
+        linkedin_url=(body.linkedin_url or "").strip() or None,
+        domain=(body.domain or "").strip().lower() or None,
+        reason=body.reason,
+        scope=body.scope,
+        campaign_id=body.campaign_id,
+    )
+    session.add(entry)
+    await session.flush()
+
+    await audit.record(
+        session,
+        entity_type="suppression",
+        entity_id=entry.id,
+        event_type="suppression_added",
+        severity="warning",
+        message=(
+            f"{entry.email or entry.phone or entry.linkedin_url or entry.domain} added to the "
+            f"do-not-contact list by {actor(user)} ({entry.reason})."
+        ),
+        campaign_id=body.campaign_id,
+        actor=actor(user),
+        payload={"scope": entry.scope, "reason": entry.reason},
+    )
+    await session.commit()
+    return serialize_suppression(entry)
+
+
+@router.delete("/platform/suppression/{entry_id}")
+async def remove_suppression(entry_id: str, session: SessionDep, user: UserDep) -> dict:
+    """Remove an entry. The audit row stays: a suppression that was lifted is
+    exactly the kind of decision someone will need to explain later."""
+    entry = await session.get(SuppressionEntry, entry_id)
+    if entry is None:
+        raise not_found("suppression entry", entry_id)
+
+    identifier = entry.email or entry.phone or entry.linkedin_url or entry.domain
+    await audit.record(
+        session,
+        entity_type="suppression",
+        entity_id=entry.id,
+        event_type="suppression_removed",
+        severity="warning",
+        message=f"{identifier} removed from the do-not-contact list by {actor(user)}.",
+        campaign_id=entry.campaign_id,
+        actor=actor(user),
+    )
+    await session.delete(entry)
+    await session.commit()
+    return {"deleted": entry_id}
+
+
+# ---------------------------------------------------------------------------
+# Representatives
+# ---------------------------------------------------------------------------
+@router.get("/users")
+async def list_users(session: SessionDep, _: UserDep) -> dict:
+    users = (await session.execute(select(User).order_by(User.created_at.asc()))).scalars().all()
+    return {"items": [serialize_user(u) for u in users]}
+
+
+@router.post("/users", status_code=201)
+async def create_user(body: UserCreate, session: SessionDep, actor_user: UserDep) -> dict:
+    """Add a representative.
+
+    Their working hours and daily activity limit are enforced by the guardrail
+    layer, so this is a safety-relevant record, not just a name on a card.
+    """
+    initials = body.initials or "".join(part[0] for part in body.name.split()[:2]).upper() or "?"
+    user = User(
+        id=new_id("usr"),
+        name=body.name.strip(),
+        initials=initials,
+        email=(body.email or "").strip().lower() or None,
+        role=body.role,
+        daily_activity_limit=body.daily_activity_limit,
+        channels_available=list(body.channels_available),
+    )
+    if body.working_hours:
+        user.working_hours = body.working_hours
+    session.add(user)
+    await session.flush()
+
+    await audit.record(
+        session,
+        entity_type="user",
+        entity_id=user.id,
+        event_type="user_created",
+        severity="success",
+        message=f"{user.name} added as a {user.role} by {actor(actor_user)}.",
+        actor=actor(actor_user),
+    )
+    await session.commit()
+    return serialize_user(user)
+
+
+# ---------------------------------------------------------------------------
+# Inbound webhook
+# ---------------------------------------------------------------------------
+@router.post("/webhooks/inbound")
+async def inbound(body: InboundWebhook, session: SessionDep, _: UserDep) -> dict:
+    """Receive a reply from any channel and hand it to the conversation agent.
+
+    Resolution is by prospect id when the provider echoes one back, and by
+    email address otherwise — that is what a real mailbox webhook gives you.
+    The lookup is deliberately not campaign-scoped unless the caller scopes it,
+    because a reply arrives at an inbox, not at a campaign.
+
+    Inbound is accepted even while the kill switch is engaged: refusing to
+    *listen* loses data, and only outbound action is dangerous. ``handle_inbound``
+    stores the reply first and only then asks an agent what to do, so a halted
+    platform still has a complete record when it comes back.
+    """
+    prospect: Optional[Prospect] = None
+    if body.prospect_id:
+        prospect = await load_prospect(session, body.prospect_id)
+    else:
+        stmt = (
+            select(Prospect)
+            .where(Prospect.email == (body.email or "").strip().lower())
+            .order_by(Prospect.updated_at.desc())
+        )
+        if body.campaign_id:
+            stmt = stmt.where(Prospect.campaign_id == body.campaign_id)
+        prospect = (await session.execute(stmt.limit(1))).scalars().first()
+
+    if prospect is None:
+        raise not_found("prospect for that reply", body.email or body.prospect_id)
+
+    if body.campaign_id and prospect.campaign_id != body.campaign_id:
+        raise invalid_request(
+            "That prospect belongs to a different campaign than the one named in the webhook."
+        )
+
+    campaign = await session.get(Campaign, prospect.campaign_id)
+    if campaign is None:
+        raise not_found("campaign", prospect.campaign_id)
+
+    result = await handle_inbound(
+        session,
+        campaign,
+        prospect,
+        channel=body.channel,
+        body=body.body,
+        external_id=body.external_id,
+    )
+    await session.commit()
+    return step_json(result)
+
+
+__all__ = ["router"]
