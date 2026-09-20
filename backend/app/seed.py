@@ -4291,4 +4291,577 @@ team rather than run autonomously.
 """.strip()
 
 
-# __APPEND__
+
+# ---------------------------------------------------------------------------
+# Helper: _fit — inline ICP fit scoring for a prospect dict, so the seed
+# creates realistic ICP scores without actually calling an agent.
+# ---------------------------------------------------------------------------
+
+def _fit(score: int, rationale: str, disqualifiers: list[str] | None = None) -> dict:
+    return {
+        "score": score,
+        "rationale": rationale,
+        "disqualifiers": disqualifiers or [],
+        "recommendation": "outreach" if score >= 70 else ("nurture" if score >= 40 else "disqualify"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Seed function — idempotent, skips if data already present.
+# ---------------------------------------------------------------------------
+
+async def seed(session: AsyncSession, *, reset: bool = False) -> None:
+    """Populate all tables with demo data.
+
+    Passing ``reset=True`` wipes all mutable rows first.  Safe to call with
+    the same session; caller is responsible for commit.
+    """
+    # ── Optional reset ──────────────────────────────────────────────────
+    if reset:
+        for model in [
+            AuditLog, AgentRun, Message, ConversationThread, Approval,
+            Signal, Prospect, Company, PromptVersion, AgentConfig,
+            CampaignRep, CampaignChannel, SuppressionEntry, RateLimitCounter,
+            KnowledgeChunk, KnowledgeDocument, Campaign, User, PlatformSetting,
+        ]:
+            await session.execute(delete(model))
+        await session.flush()
+
+    # ── Guard: already seeded? ──────────────────────────────────────────
+    existing = (await session.execute(select(func.count()).select_from(User))).scalar_one()
+    if existing > 0 and not reset:
+        return
+
+    # ── Platform settings ───────────────────────────────────────────────
+    for key, value in [
+        ("global_kill_switch", {"engaged": False, "reason": None, "engaged_by": None}),
+        ("default_timezone", {"value": "Asia/Kolkata"}),
+        ("working_hours_enforcement", {"enabled": True}),
+        ("max_touches_per_prospect", {"value": 7}),
+        ("default_reply_window_days", {"value": 3}),
+        ("brand_name", {"value": "Corvus Flightdeck"}),
+    ]:
+        session.add(PlatformSetting(id=new_id("ps"), key=key, value=value))
+
+    # ── Users ───────────────────────────────────────────────────────────
+    for u in USERS:
+        session.add(User(**{k: v for k, v in u.items()}))
+    await session.flush()
+
+    # ── Companies ───────────────────────────────────────────────────────
+    companies = [
+        ("co_stripe",       "Stripe",              "US",    "fintech",       5_000,  "Series I",    "https://stripe.com"),
+        ("co_razorpay",     "Razorpay",            "IN",    "fintech",       3_000,  "Series F",    "https://razorpay.com"),
+        ("co_notion",       "Notion",              "US",    "productivity",  1_000,  "Series C",    "https://notion.so"),
+        ("co_zepto",        "Zepto",               "IN",    "e-commerce",    4_200,  "Series F",    "https://zeptonow.com"),
+        ("co_plaid",        "Plaid",               "US",    "fintech",       1_200,  "Series D",    "https://plaid.com"),
+        ("co_browserstack", "BrowserStack",        "IN",    "devtools",      1_800,  "PE-backed",   "https://browserstack.com"),
+        ("co_groww",        "Groww",               "IN",    "wealthtech",    3_600,  "Series F",    "https://groww.in"),
+        ("co_figma",        "Figma",               "US",    "design",        1_100,  "Acquired",    "https://figma.com"),
+        ("co_freshworks",   "Freshworks",          "IN",    "saas",          7_000,  "Public",      "https://freshworks.com"),
+        ("co_chargebee",    "Chargebee",           "IN",    "billing",         900,  "Series H",    "https://chargebee.com"),
+        ("co_jupiter",      "Jupiter Money",       "IN",    "neobank",       1_000,  "Series C",    "https://jupiter.money"),
+        ("co_atlassian",    "Atlassian",           "AU",    "devtools",     12_000,  "Public",      "https://atlassian.com"),
+        ("co_cred",         "CRED",                "IN",    "fintech",       3_000,  "Series F",    "https://cred.club"),
+        ("co_setu",         "Setu",                "IN",    "api-infra",       300,  "Acquired",    "https://setu.co"),
+        ("co_postman",      "Postman",             "US",    "devtools",      1_400,  "Series D",    "https://postman.com"),
+        ("co_intercom",     "Intercom",            "US",    "cx",            1_000,  "PE-backed",   "https://intercom.com"),
+        ("co_vercel",       "Vercel",              "US",    "devops",          500,  "Series C",    "https://vercel.com"),
+        ("co_smallcase",    "Smallcase",           "IN",    "wealthtech",      400,  "Series C",    "https://smallcase.com"),
+        ("co_moengage",     "MoEngage",            "IN",    "martech",       1_200,  "Series E",    "https://moengage.com"),
+        ("co_hasura",       "Hasura",              "US",    "api-infra",       350,  "Series C",    "https://hasura.io"),
+    ]
+    for cid, name, hq, industry, headcount, stage, website in companies:
+        session.add(Company(
+            id=cid, name=name, hq_country=hq, industry=industry,
+            headcount=headcount, funding_stage=stage, website=website,
+            linkedin_url=f"{website.rstrip('/')}/company",
+        ))
+    await session.flush()
+
+    # ── Campaigns ───────────────────────────────────────────────────────
+    # CMP_A — live, US SaaS CTOs
+    session.add(Campaign(
+        id=CMP_A,
+        name="US SaaS CTO — Flightdeck Launch",
+        objective="Book 8 product demos with CTOs and VPEs at 100-500 person US SaaS companies in the first 30 days of Flightdeck GA.",
+        icp={
+            "titles": ["CTO", "VP Engineering", "Head of Engineering", "Director of Engineering"],
+            "company_size": {"min": 80, "max": 600},
+            "regions": ["US"],
+            "industries": ["saas", "devtools", "api-infra", "productivity"],
+            "buying_signals": ["recent hiring surge", "new CTO", "Series B+", "remote-first", "github actions usage"],
+        },
+        product_context=PRODUCT_CONTEXT,
+        status="live",
+        owner_id=USR_MANAGER,
+        daily_prospect_limit=20,
+        max_touches_per_prospect=6,
+        reply_window_days=3,
+        working_hours_only=True,
+        require_approval_for=["linkedin"],
+        created_at=ago(days=18),
+        updated_at=ago(days=1),
+    ))
+
+    # CMP_B — live, India BFSI CIOs
+    session.add(Campaign(
+        id=CMP_B,
+        name="India BFSI CIO — Compliance Angle",
+        objective="Secure 5 discovery calls with CIOs/CDOs at Indian banks, NBFCs and insurance carriers who face RBI/SEBI scrutiny on AI adoption.",
+        icp={
+            "titles": ["CIO", "CDO", "CTO", "Head of Technology", "Chief Digital Officer"],
+            "company_size": {"min": 500, "max": 50000},
+            "regions": ["IN"],
+            "industries": ["fintech", "banking", "insurance", "neobank", "wealthtech"],
+            "buying_signals": ["RBI circular compliance", "AI policy mandate", "digital transformation hire", "ISO 27001 renewal"],
+        },
+        product_context=PRODUCT_CONTEXT,
+        status="live",
+        owner_id=USR_MANAGER,
+        daily_prospect_limit=10,
+        max_touches_per_prospect=7,
+        reply_window_days=5,
+        working_hours_only=True,
+        require_approval_for=["linkedin", "voice"],
+        created_at=ago(days=12),
+        updated_at=ago(hours=6),
+    ))
+
+    # CMP_C — paused, voice AI founders
+    session.add(Campaign(
+        id=CMP_C,
+        name="Voice AI Founders — Early Adopter",
+        objective="Onboard 3 voice-AI startup CTOs onto a technical design partnership — free 90-day access in exchange for co-development input.",
+        icp={
+            "titles": ["CTO", "Co-founder", "Founding Engineer"],
+            "company_size": {"min": 5, "max": 80},
+            "regions": ["US", "UK", "IN", "EU"],
+            "industries": ["voice-ai", "conversational-ai", "contact-center", "speech-tech"],
+            "buying_signals": ["series A", "deployed voice product", "active github", "recently hired ML engineers"],
+        },
+        product_context=PRODUCT_CONTEXT,
+        status="paused",
+        paused_at=ago(days=2),
+        paused_by_id=USR_MANAGER,
+        pause_reason="Founder event pipeline being reworked — resuming after YC batch announced.",
+        owner_id=USR_MANAGER,
+        daily_prospect_limit=8,
+        max_touches_per_prospect=4,
+        reply_window_days=2,
+        working_hours_only=False,
+        require_approval_for=[],
+        created_at=ago(days=25),
+        updated_at=ago(days=2),
+    ))
+
+    # CMP_D — draft, enterprise expansion
+    session.add(Campaign(
+        id=CMP_D,
+        name="Enterprise Expansion — Guard Upsell",
+        objective="Expand 15 existing Flightdeck accounts to the Guard compliance tier within the next quarter.",
+        icp={
+            "titles": ["CTO", "VP Engineering", "Head of Security", "CISO"],
+            "company_size": {"min": 500},
+            "regions": ["US", "EU"],
+            "industries": ["fintech", "healthtech", "enterprise-saas"],
+            "buying_signals": ["existing flightdeck customer", "renewal < 120 days", "ai coding agent detected", "regulated workload in repo"],
+        },
+        product_context=PRODUCT_CONTEXT,
+        status="draft",
+        owner_id=USR_MANAGER,
+        daily_prospect_limit=5,
+        max_touches_per_prospect=5,
+        reply_window_days=4,
+        working_hours_only=True,
+        require_approval_for=["email", "linkedin", "voice"],
+        created_at=ago(days=3),
+        updated_at=ago(hours=1),
+    ))
+    await session.flush()
+
+    # ── Campaign channels ────────────────────────────────────────────────
+    for cmp_id, channels in [
+        (CMP_A, [("email", 0), ("linkedin", 1)]),
+        (CMP_B, [("email", 0), ("linkedin", 1), ("voice", 2)]),
+        (CMP_C, [("email", 0), ("linkedin", 1)]),
+        (CMP_D, [("email", 0), ("linkedin", 1), ("voice", 2)]),
+    ]:
+        for ch, priority in channels:
+            session.add(CampaignChannel(
+                id=new_id("cc"), campaign_id=cmp_id, channel=ch,
+                priority=priority, paused=False,
+                daily_limit=50 if ch == "email" else 15,
+            ))
+
+    # ── Campaign reps ────────────────────────────────────────────────────
+    for cmp_id, rep_ids in [
+        (CMP_A, [USR_RAO, USR_FERNANDES]),
+        (CMP_B, [USR_IYER, USR_MANAGER]),
+        (CMP_C, [USR_FERNANDES]),
+        (CMP_D, [USR_RAO, USR_IYER]),
+    ]:
+        for rep_id in rep_ids:
+            session.add(CampaignRep(id=new_id("cr"), campaign_id=cmp_id, user_id=rep_id))
+    await session.flush()
+
+    # ── Agent configs ────────────────────────────────────────────────────
+    for cmp_id in [CMP_A, CMP_B, CMP_C]:
+        for agent_key, model, daily_limit in [
+            ("prospect_generation",    "claude-haiku-4-5",  500),
+            ("research_enrichment",    "claude-haiku-4-5",  300),
+            ("icp_fit",                "claude-haiku-4-5",  300),
+            ("outreach_strategist",    "claude-sonnet-4-6", 100),
+            ("personalisation",        "claude-sonnet-4-6", 100),
+            ("reply_handler",          "claude-sonnet-4-6",  80),
+        ]:
+            session.add(AgentConfig(
+                id=new_id("ac"), campaign_id=cmp_id, agent_key=agent_key,
+                model=model, paused=False,
+                daily_run_limit=daily_limit,
+                temperature=0.4,
+            ))
+    await session.flush()
+
+    # ── Prompt versions ──────────────────────────────────────────────────
+    # Each live campaign gets all 6 active prompt versions.
+    for cmp_id in [CMP_A, CMP_B]:
+        for agent_key, content in DEFAULT_PROMPTS.items():
+            session.add(PromptVersion(
+                id=new_id("pv"), campaign_id=cmp_id, agent_key=agent_key,
+                version=1, content=content, is_active=True,
+                created_by=USR_MANAGER, created_at=ago(days=14),
+            ))
+    await session.flush()
+
+    # ── Prospects ────────────────────────────────────────────────────────
+    # 20 prospects spread across campaigns and funnel stages.
+    prospects_data = [
+        # (id, cmp_id, company_id, name, title, email, linkedin, stage, icp_score, identity_key)
+        ("prs_001", CMP_A, "co_stripe",      "Jordan Kessler",   "VP Engineering",      "jkessler@stripe.com",      "linkedin.com/in/jkessler",    "contacted",  88, "jordan.kessler@stripe.com"),
+        ("prs_002", CMP_A, "co_notion",       "Priya Haldar",     "CTO",                 "priya.h@notion.so",        "linkedin.com/in/prihahaldar", "engaged",    91, "priya.haldar@notion.so"),
+        ("prs_003", CMP_A, "co_plaid",        "Ethan Moreira",    "Director Engineering","e.moreira@plaid.com",      "linkedin.com/in/ethanmoreira","researched", 76, "ethan.moreira@plaid.com"),
+        ("prs_004", CMP_A, "co_postman",      "Ritika Nair",      "Head of Engineering", "ritika@postman.com",       "linkedin.com/in/ritikanair",  "qualified",  82, "ritika.nair@postman.com"),
+        ("prs_005", CMP_A, "co_vercel",       "Sam Ito",          "CTO",                 "sam@vercel.com",           "linkedin.com/in/samito",      "discovered", 79, "sam.ito@vercel.com"),
+        ("prs_006", CMP_A, "co_hasura",       "Tanvir Ahmed",     "VP Engineering",      "tanvir@hasura.io",         "linkedin.com/in/tanvir",      "contacted",  84, "tanvir.ahmed@hasura.io"),
+        ("prs_007", CMP_A, "co_intercom",     "Claire Dubois",    "Engineering Director","claire@intercom.com",      "linkedin.com/in/clairedubois","meeting",    93, "claire.dubois@intercom.com"),
+        ("prs_008", CMP_B, "co_razorpay",     "Siddharth Menon",  "CTO",                 "siddharth.m@razorpay.com", "linkedin.com/in/siddharthmenon","contacted",85, "siddharth.menon@razorpay.com"),
+        ("prs_009", CMP_B, "co_groww",        "Amrita Pillai",    "CIO",                 "amrita.p@groww.in",        "linkedin.com/in/amritapillai","engaged",   90, "amrita.pillai@groww.in"),
+        ("prs_010", CMP_B, "co_cred",         "Rohit Jha",        "CDO",                 "rohit.jha@cred.club",      "linkedin.com/in/rohitjha",    "researched", 72, "rohit.jha@cred.club"),
+        ("prs_011", CMP_B, "co_jupiter",      "Nandita Rao",      "Head of Technology",  "nandita@jupiter.money",    "linkedin.com/in/nanditarao",  "qualified",  78, "nandita.rao@jupiter.money"),
+        ("prs_012", CMP_B, "co_setu",         "Kiran Bhat",       "CTO",                 "kiran@setu.co",            "linkedin.com/in/kiranbhat",   "contacted",  81, "kiran.bhat@setu.co"),
+        ("prs_013", CMP_B, "co_zepto",        "Deepak Sharma",    "VP Technology",       "deepak@zeptonow.com",      "linkedin.com/in/deepaksharma","discovered",68, "deepak.sharma@zeptonow.com"),
+        ("prs_014", CMP_B, "co_smallcase",    "Ananya Krishnan",  "CTO",                 "ananya@smallcase.com",     "linkedin.com/in/ananyakr",    "meeting",    95, "ananya.krishnan@smallcase.com"),
+        ("prs_015", CMP_C, "co_browserstack", "Aarav Mehta",      "Co-founder & CTO",    "aarav@browserstack.com",   "linkedin.com/in/aaravmehta",  "contacted",  88, "aarav.mehta@browserstack.com"),
+        ("prs_016", CMP_C, "co_moengage",     "Sunita Pillai",    "Head of AI",          "sunita@moengage.com",      "linkedin.com/in/sunitapillai","researched", 74, "sunita.pillai@moengage.com"),
+        ("prs_017", CMP_A, "co_figma",        "Lars Eriksson",    "Engineering Lead",    "lars@figma.com",           "linkedin.com/in/larseriksson","contacted",  77, "lars.eriksson@figma.com"),
+        # prs_018: duplicate identity key for prs_002 — tests conflict guardrail
+        ("prs_018", CMP_B, "co_notion",       "Priya Haldar",     "CTO",                 "priya.h@notion.so",        "linkedin.com/in/prihahaldar", "discovered", 65, "priya.haldar@notion.so"),
+        ("prs_019", CMP_A, "co_atlassian",    "Yuki Tanaka",      "VP Engineering",      "ytanaka@atlassian.com",    "linkedin.com/in/yukitanaka",  "opportunity",97, "yuki.tanaka@atlassian.com"),
+        ("prs_020", CMP_B, "co_chargebee",    "Meera Subramanian","CTO",                 "meera@chargebee.com",      "linkedin.com/in/meераsubram", "qualified",  80, "meera.subramanian@chargebee.com"),
+    ]
+
+    stage_ts = {
+        "discovered":  ago(days=10),
+        "researched":  ago(days=8),
+        "qualified":   ago(days=6),
+        "contacted":   ago(days=4),
+        "engaged":     ago(days=2),
+        "meeting":     ago(days=1),
+        "opportunity": ago(hours=6),
+        "closed":      ago(hours=1),
+    }
+    for pid, cmp_id, co_id, name, title, email, li, stage, score, ident_key in prospects_data:
+        first, *rest = name.split()
+        last = " ".join(rest)
+        session.add(Prospect(
+            id=pid, campaign_id=cmp_id, company_id=co_id,
+            first_name=first, last_name=last,
+            title=title, email=email, linkedin_url=f"https://{li}",
+            stage=stage, icp_score=score,
+            identity_key=ident_key,
+            touches=max(0, ["discovered","researched","qualified","contacted","engaged","meeting","opportunity"].index(stage)),
+            last_touched_at=stage_ts.get(stage),
+            researched_at=stage_ts.get("researched") if stage not in ("discovered",) else None,
+            qualified_at=stage_ts.get("qualified") if stage not in ("discovered","researched") else None,
+            icp_fit=_fit(score, f"Strong match on ICP for {title} at company in target segment.", [] if score >= 75 else ["Company slightly outside target size"]),
+            created_at=ago(days=12),
+        ))
+    await session.flush()
+
+    # ── Signals ──────────────────────────────────────────────────────────
+    signals = [
+        ("sig_001", "prs_001", CMP_A, "linkedin_post",  "Jordan posted about scaling eng hiring — mentioned 40 new backend roles.", ago(days=5)),
+        ("sig_002", "prs_002", CMP_A, "funding",        "Notion closed $150M Series C extension; blog post mentions AI-first engineering roadmap.", ago(days=3)),
+        ("sig_003", "prs_007", CMP_A, "job_posting",    "Intercom posted 3 Senior AI Engineer roles on LinkedIn.", ago(days=2)),
+        ("sig_004", "prs_009", CMP_B, "news_mention",   "Groww CIO quoted in Economic Times on RBI AI governance circular.", ago(days=1)),
+        ("sig_005", "prs_014", CMP_B, "linkedin_post",  "Ananya published article: 'Why we adopted AI code review across 200 engineers'.", ago(hours=18)),
+        ("sig_006", "prs_019", CMP_A, "product_usage",  "Atlassian account reached 500 weekly active users on Flightdeck trial.", ago(hours=4)),
+    ]
+    for sid, pid, cmp_id, stype, body, ts in signals:
+        session.add(Signal(
+            id=sid, prospect_id=pid, campaign_id=cmp_id,
+            signal_type=stype, body=body, detected_at=ts, processed=True,
+        ))
+    await session.flush()
+
+    # ── Conversation threads + messages ──────────────────────────────────
+    # Thread 1: engaged prospect prs_002 (Priya Haldar, Notion)
+    session.add(ConversationThread(
+        id="thr_001", campaign_id=CMP_A, prospect_id="prs_002",
+        channel="email", status="open", assigned_to=USR_RAO,
+        last_message_at=ago(hours=3), human_takeover=False,
+        created_at=ago(days=4),
+    ))
+    for msg_id, direction, body, ts, channel in [
+        ("msg_001", "outbound",
+         "Hi Priya, saw the Notion Series C news — congratulations on the AI-first engineering roadmap. "
+         "We're working with a handful of SaaS CTOs to cut PR review cycle time using context-aware AI. "
+         "Worth a 20-minute call this week?",
+         ago(days=4), "email"),
+        ("msg_002", "inbound",
+         "Thanks! Yes, we're actively looking at this space. Can you send over more details on how the model handles monorepos? "
+         "We have about 300 repos on GitHub.",
+         ago(days=3, hours=4), "email"),
+        ("msg_003", "outbound",
+         "Great question — Flightdeck indexes your full org graph, not repo-by-repo, so cross-repo call chains and shared libs "
+         "are in context on every review. I'll send a short technical brief. What's your engineering stack — primarily TS/Go or polyglot?",
+         ago(days=3), "email"),
+        ("msg_004", "inbound",
+         "Mostly TypeScript and Go, with some Python for ML tooling. A brief would be great. Also — do you have any GDPR/SOC2 docs? "
+         "Our legal team will ask.",
+         ago(days=2, hours=6), "email"),
+        ("msg_005", "outbound",
+         "Attaching our SOC 2 Type II one-pager and the technical data flow diagram — both fully GDPR-mapped. "
+         "I'll also include a case study from a similar-sized SaaS org (anonymised). "
+         "Happy to get our Head of Security on a call with your legal team if helpful. Are you free Thursday 4–5pm IST?",
+         ago(hours=3), "email"),
+    ]:
+        session.add(Message(
+            id=msg_id, thread_id="thr_001", campaign_id=CMP_A, prospect_id="prs_002",
+            direction=direction, channel=channel, body=body,
+            sent_at=ts, delivered=True, opened=direction=="outbound",
+            sender_id=USR_RAO if direction == "outbound" else None,
+        ))
+
+    # Thread 2: meeting booked prs_007 (Claire Dubois, Intercom)
+    session.add(ConversationThread(
+        id="thr_002", campaign_id=CMP_A, prospect_id="prs_007",
+        channel="email", status="open", assigned_to=USR_FERNANDES,
+        last_message_at=ago(hours=10), human_takeover=True,
+        created_at=ago(days=6),
+    ))
+    for msg_id, direction, body, ts in [
+        ("msg_006", "outbound",
+         "Hi Claire — Intercom's 3 new AI Engineer postings caught my eye. If you're scaling AI-assisted development, "
+         "we should talk: Corvus Flightdeck does repo-wide PR review that understands Intercom's architecture, not just the diff. "
+         "15 minutes?",
+         ago(days=6)),
+        ("msg_007", "inbound",
+         "Hi, yes I'm interested. We're evaluating a few tools. Can we do next Tuesday at 10am PT?",
+         ago(days=5)),
+        ("msg_008", "outbound",
+         "Tuesday 10am PT works perfectly — I'll send a calendar invite. Looking forward to it!",
+         ago(days=4, hours=22)),
+    ]:
+        session.add(Message(
+            id=msg_id, thread_id="thr_002", campaign_id=CMP_A, prospect_id="prs_007",
+            direction=direction, channel="email", body=body,
+            sent_at=ts, delivered=True, opened=True,
+            sender_id=USR_FERNANDES if direction == "outbound" else None,
+        ))
+
+    # Thread 3: BFSI engaged prs_009 (Amrita Pillai, Groww)
+    session.add(ConversationThread(
+        id="thr_003", campaign_id=CMP_B, prospect_id="prs_009",
+        channel="email", status="open", assigned_to=USR_IYER,
+        last_message_at=ago(hours=8), human_takeover=False,
+        created_at=ago(days=5),
+    ))
+    for msg_id, direction, body, ts in [
+        ("msg_009", "outbound",
+         "Dear Amrita, the RBI's recent circular on AI governance in financial services is creating real compliance pressure "
+         "for engineering teams. Corvus Flightdeck's Guard module enforces AI coding policies at the PR level — "
+         "every AI-generated line is attested before it merges. Would a 20-minute conversation be valuable?",
+         ago(days=5)),
+        ("msg_010", "inbound",
+         "This is timely. We're actually doing an internal audit this quarter. Can you share a one-pager on the Guard compliance features?",
+         ago(days=4)),
+        ("msg_011", "outbound",
+         "Sending the Guard datasheet and a summary of how three Indian fintechs used it to satisfy their internal AI governance audits. "
+         "Would you prefer a technical walkthrough with your security team or a business overview for leadership first?",
+         ago(hours=8)),
+    ]:
+        session.add(Message(
+            id=msg_id, thread_id="thr_003", campaign_id=CMP_B, prospect_id="prs_009",
+            direction=direction, channel="email", body=body,
+            sent_at=ts, delivered=True, opened=True,
+            sender_id=USR_IYER if direction == "outbound" else None,
+        ))
+    await session.flush()
+
+    # ── Approvals ────────────────────────────────────────────────────────
+    approvals = [
+        # (id, campaign_id, prospect_id, atype, channel, status, content, created_at, reviewed_at, reviewer_id, notes)
+        ("apv_001", CMP_A, "prs_004", "outreach",  "linkedin", "pending",
+         "Hi Ritika — noticed Postman's recent engineering blog on AI-assisted API design. "
+         "Our platform integrates directly with your dev workflow. 15 minutes?",
+         ago(hours=6), None, None, None),
+        ("apv_002", CMP_B, "prs_008", "outreach",  "linkedin", "pending",
+         "Namaste Siddharth — Razorpay's scale requires serious engineering governance. "
+         "Flightdeck reviews every PR with full codebase context. Worth a conversation?",
+         ago(hours=4), None, None, None),
+        ("apv_003", CMP_B, "prs_012", "outreach",  "voice",    "pending",
+         "Script: Hello, is this Kiran? This is Aditya from Corvus Labs — we help fintech CTOs enforce AI coding policies. "
+         "I'm calling because Setu's API-first model would be a strong fit. Do you have 2 minutes?",
+         ago(hours=2), None, None, None),
+        ("apv_004", CMP_A, "prs_006", "follow_up", "email",    "pending",
+         "Hi Tanvir — just bumping this up in case it got buried. "
+         "Happy to share Flightdeck's Hasura-specific integration notes if that would help?",
+         ago(hours=1), None, None, None),
+        ("apv_005", CMP_A, "prs_001", "outreach",  "linkedin", "approved",
+         "Jordan — scaling eng at Stripe is no joke. Flightdeck's cost-attribution layer "
+         "gives VPEs per-PR DORA visibility. Worth 20 minutes?",
+         ago(days=3), ago(days=3, hours=1), USR_MANAGER, "Good angle — approved."),
+        ("apv_006", CMP_B, "prs_011", "outreach",  "linkedin", "approved",
+         "Hi Nandita — Jupiter's growth story deserves an engineering platform that keeps pace. "
+         "Flightdeck handles monorepo PR reviews at scale. 15 minutes?",
+         ago(days=2), ago(days=2, hours=2), USR_MANAGER, None),
+        ("apv_007", CMP_C, "prs_015", "outreach",  "email",    "rejected",
+         "Hi Aarav — BrowserStack's infrastructure expertise makes you exactly the kind of "
+         "design partner we're looking for. Interested in a co-development programme?",
+         ago(days=5), ago(days=4), USR_MANAGER,
+         "Too generic — needs the voice AI angle. Rewrite before sending."),
+    ]
+    for apv_id, cmp_id, pid, atype, channel, status, content, created, reviewed, reviewer, notes in approvals:
+        session.add(Approval(
+            id=apv_id, campaign_id=cmp_id, prospect_id=pid,
+            approval_type=atype, channel=channel, status=status,
+            content=content, created_at=created,
+            reviewed_at=reviewed, reviewed_by=reviewer, review_notes=notes,
+        ))
+    await session.flush()
+
+    # ── Suppression list ─────────────────────────────────────────────────
+    for sid, email, reason, scope in [
+        ("sup_001", "karan.sharma@corvuslabs.ai", "internal team member", "global"),
+        ("sup_002", "legal@atlassian.com",        "legal team — do not contact", "global"),
+        ("sup_003", "noreply@notion.so",           "automated address", "global"),
+    ]:
+        session.add(SuppressionEntry(
+            id=sid, email=email, reason=reason, scope=scope,
+            added_by=USR_MANAGER, added_at=ago(days=20),
+        ))
+    await session.flush()
+
+    # ── Agent run history (representative sample) ─────────────────────────
+    run_pairs = [
+        ("run_001", CMP_A, "prs_001", "research_enrichment", "succeeded", ago(days=9)),
+        ("run_002", CMP_A, "prs_001", "icp_fit",             "succeeded", ago(days=9)),
+        ("run_003", CMP_A, "prs_001", "outreach_strategist", "succeeded", ago(days=8)),
+        ("run_004", CMP_A, "prs_001", "personalisation",     "succeeded", ago(days=8)),
+        ("run_005", CMP_A, "prs_002", "research_enrichment", "succeeded", ago(days=8)),
+        ("run_006", CMP_A, "prs_002", "icp_fit",             "succeeded", ago(days=8)),
+        ("run_007", CMP_A, "prs_007", "personalisation",     "succeeded", ago(days=5)),
+        ("run_008", CMP_B, "prs_009", "research_enrichment", "succeeded", ago(days=4)),
+        ("run_009", CMP_B, "prs_009", "icp_fit",             "succeeded", ago(days=4)),
+        ("run_010", CMP_A, "prs_003", "research_enrichment", "failed",    ago(days=7)),
+    ]
+    for run_id, cmp_id, pid, agent_key, status, ts in run_pairs:
+        session.add(AgentRun(
+            id=run_id, campaign_id=cmp_id, prospect_id=pid,
+            agent_key=agent_key,
+            idempotency_key=f"{cmp_id}:{pid}:{agent_key}:v1",
+            status=status,
+            model="claude-haiku-4-5" if agent_key in ("research_enrichment","icp_fit") else "claude-sonnet-4-6",
+            executor="simulator",
+            started_at=ts,
+            finished_at=ts + dt.timedelta(seconds=2),
+            latency_ms=1800 if status == "succeeded" else 800,
+            cost_usd=0.0008 if status == "succeeded" else 0.0,
+            output={"status": "ok"} if status == "succeeded" else None,
+            error="Transport timeout" if status == "failed" else None,
+        ))
+    await session.flush()
+
+    # ── Audit log (key system events) ────────────────────────────────────
+    audit_events = [
+        ("Campaign CMP_A created",          "campaign", CMP_A, "campaign_created",    "info",  USR_MANAGER, ago(days=18)),
+        ("Campaign CMP_B created",          "campaign", CMP_B, "campaign_created",    "info",  USR_MANAGER, ago(days=12)),
+        ("Campaign CMP_C paused",           "campaign", CMP_C, "campaign_paused",     "warn",  USR_MANAGER, ago(days=2)),
+        ("Prospect prs_007 reached meeting","prospect",  "prs_007", "stage_advanced", "info",  "system",    ago(days=1)),
+        ("Prospect prs_019 is opportunity", "prospect",  "prs_019", "stage_advanced", "info",  "system",    ago(hours=6)),
+        ("Approval apv_007 rejected",       "approval",  "apv_007", "approval_rejected","warn", USR_MANAGER, ago(days=4)),
+        ("Inbound reply from prs_002",      "message",   "msg_002", "inbound_received","info",  "system",    ago(days=3, hours=4)),
+        ("Agent run_010 failed",            "agent_run", "run_010", "agent_failed",    "error", "system",    ago(days=7)),
+    ]
+    for message, entity_type, entity_id, event_type, severity, actor, ts in audit_events:
+        session.add(AuditLog(
+            id=new_id("al"), entity_type=entity_type, entity_id=entity_id,
+            event_type=event_type, severity=severity, message=message,
+            actor=actor, occurred_at=ts,
+        ))
+    await session.flush()
+
+    # ── Knowledge base — ingest via normal RAG pipeline ──────────────────
+    # Pull the big doc strings already defined above in this module.
+    import sys
+    this = sys.modules[__name__]
+    doc_map = {
+        "product_overview":   ("PRODUCT_OVERVIEW_DOC",   "product_overview", "Corvus Flightdeck — Product Overview"),
+        "icp_us_saas":        ("ICP_US_SAAS_DOC",        "icp",              "ICP: US SaaS CTO (Campaign A)"),
+        "icp_india_bfsi":     ("ICP_INDIA_BFSI_DOC",     "icp",              "ICP: India BFSI CIO (Campaign B)"),
+        "icp_voice_founders": ("ICP_VOICE_DOC",          "icp",              "ICP: Voice AI Founders (Campaign C)"),
+        "playbook_us_saas":   ("PLAYBOOK_US_SAAS_DOC",   "playbook",         "Outreach Playbook: US SaaS CTO"),
+        "playbook_india_bfsi":("PLAYBOOK_INDIA_BFSI_DOC","playbook",         "Outreach Playbook: India BFSI CIO"),
+        "objection_handling": ("OBJECTION_DOC",          "playbook",         "Objection Handling Guide"),
+        "case_studies":       ("CASE_STUDIES_DOC",       "case_study",       "Customer Case Studies"),
+        "expansion_icp":      ("EXPANSION_ICP_DOC",      "icp",              "ICP: Enterprise Expansion (Campaign D)"),
+    }
+    # Assign docs to campaigns (some are platform-wide, some campaign-specific)
+    doc_campaign_map = {
+        "product_overview":   [CMP_A, CMP_B, CMP_C, CMP_D],
+        "icp_us_saas":        [CMP_A],
+        "icp_india_bfsi":     [CMP_B],
+        "icp_voice_founders": [CMP_C],
+        "playbook_us_saas":   [CMP_A],
+        "playbook_india_bfsi":[CMP_B],
+        "objection_handling": [CMP_A, CMP_B, CMP_C, CMP_D],
+        "case_studies":       [CMP_A, CMP_B, CMP_C, CMP_D],
+        "expansion_icp":      [CMP_D],
+    }
+    for doc_key, (attr_name, doc_type, title) in doc_map.items():
+        content = getattr(this, attr_name, None)
+        if not content:
+            continue
+        for cmp_id in doc_campaign_map.get(doc_key, []):
+            await ingest_document(
+                session,
+                campaign_id=cmp_id,
+                doc_type=doc_type,
+                title=title,
+                content=content,
+                source=f"seed:{doc_key}",
+                author=USR_MANAGER,
+            )
+
+    await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+async def main(reset: bool = False) -> None:
+    await init_models()
+    async with session_scope() as session:
+        await seed(session, reset=reset)
+        await session.commit()
+    print("✓ Seed complete.")
+
+
+if __name__ == "__main__":
+    import sys
+    reset = "--reset" in sys.argv
+    asyncio.run(main(reset=reset))
+

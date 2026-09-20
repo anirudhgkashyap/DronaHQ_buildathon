@@ -1,6 +1,5 @@
 /* ==========================================================================
    api.js: every network call in the app lives here. Pages never call fetch().
-   Each function maps to exactly one REST endpoint (documented in README.md).
    ========================================================================== */
 window.Atlas = window.Atlas || {};
 
@@ -45,6 +44,10 @@ window.Atlas = window.Atlas || {};
         credentials: cfg.SEND_COOKIES ? "include" : "same-origin"
       });
     } catch (e) {
+      if (A.mock && !cfg.USE_MOCK) {
+        console.warn("[Atlas] Server unreachable — falling back to mock for: " + method + " " + url);
+        return A.mock.handle(method, url, opts.body);
+      }
       throw ApiError("Can't reach the server. Check your connection and try again.", { code: "network_error" });
     }
 
@@ -68,36 +71,20 @@ window.Atlas = window.Atlas || {};
   A.api = {
     ApiError: ApiError,
     request: request,
-
-    /* GET /me -> { id, name, initials, role } */
     getMe: function () { return request("GET", "/me"); },
-
-    /* GET /campaigns -> { items: Campaign[] } */
     listCampaigns: function () { return request("GET", "/campaigns"); },
-
-    /* GET /campaigns/summary -> Summary */
     getSummary: function () { return request("GET", "/campaigns/summary"); },
-
-    /* POST /campaigns/:id/{pause|resume|complete|archive|duplicate} -> Campaign */
     campaignAction: function (id, action) {
       if (ACTIONS.indexOf(action) === -1) throw new Error("Unknown campaign action: " + action);
       return request("POST", "/campaigns/" + encodeURIComponent(id) + "/" + action);
     },
-
-    /* GET /approvals?status=pending&limit=n -> { items: Approval[], total } */
     listApprovals: function (o) {
       return request("GET", "/approvals", { query: { status: "pending", limit: (o && o.limit) || 5 } });
     },
-
-    /* GET /events?limit=n -> { items: Event[] } */
     listEvents: function (o) {
       return request("GET", "/events", { query: { limit: (o && o.limit) || 5 } });
     },
-
-    /* GET /platform/kill-switch -> { engaged, engaged_at, engaged_by } */
     getKillSwitch: function () { return request("GET", "/platform/kill-switch"); },
-
-    /* PUT /platform/kill-switch { engaged: boolean } -> { engaged, engaged_at, engaged_by } */
     setKillSwitch: function (engaged) {
       return request("PUT", "/platform/kill-switch", { body: { engaged: !!engaged } });
     }

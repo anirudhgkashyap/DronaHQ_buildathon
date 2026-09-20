@@ -470,14 +470,27 @@ class DronaHQClient:
                 f"(set {AGENT_ID_SETTINGS.get(agent_key, 'DRONAHQ_AGENT_*')} or AgentConfig.dronahq_agent_id)"
             )
 
-        url = f"{self.base_url}/{agent_id}"
-        payload = {
-            "variables": variables,
-            "prompt": prompt,
-            "response_format": {"type": "json_schema", "json_schema": output_schema},
+        # agent_id may be a full webhook URL or just the path/id segment.
+        # If it already starts with http, use it directly; otherwise prepend base.
+        if agent_id.startswith("http"):
+            url = agent_id
+        else:
+            url = f"{self.base_url}/{agent_id}"
+
+        # DronaHQ webhook agents expect the prompt as the top-level "message"
+        # field.  We embed the full rendered prompt (already includes RAG +
+        # variables) so the agent receives a self-contained instruction.
+        # thread_id keeps context across follow-up calls for the same prospect.
+        payload: dict = {
+            "message": prompt,
         }
-        if model:
-            payload["model"] = model
+        # Include structured variables as a side-channel for agents that
+        # surface them via {{variable}} syntax inside DronaHQ's own prompt.
+        if variables:
+            payload["variables"] = {
+                k: v for k, v in variables.items()
+                if k not in {"retrieved_knowledge", "campaign_name"}
+            }
 
         started = time.perf_counter()
         response, attempts = await self._post_with_retries(url, payload, agent_key)
@@ -520,8 +533,11 @@ class DronaHQClient:
         no amount of waiting fixes that — retrying only delays the error and
         eats the rate-limit budget shared with the calls that could succeed.
         """
+        # DronaHQ webhook auth — send as both common formats; the endpoint
+        # accepts whichever it was configured with.
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": self.api_key,
+            "api-key": self.api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -590,7 +606,10 @@ class DronaHQClient:
         if not isinstance(body, dict):
             return json.dumps(body), {}
 
-        for key in ("output", "data", "result", "response", "text", "message", "content"):
+        # DronaHQ webhook agents return the agent's reply in one of these keys.
+        # "response" is the most common in the webhook trigger flow; others are
+        # seen when the agent uses a structured output block.
+        for key in ("response", "output", "data", "result", "text", "message", "content"):
             value = body.get(key)
             if isinstance(value, str) and value.strip():
                 return value, body

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: atlas-sdr-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///./atlas.db
+      - key: ENV
+        value: production
+      - key: CHANNELS_DRY_RUN
+        value: "true"
+      - key: SCHEDULER_ENABLED
+        value: "true"
+      - key: CORS_ORIGINS
+        value: "*"
+      # Add your DronaHQ creds in the Render dashboard:
+      # DRONAHQ_BASE_URL, DRONAHQ_API_KEY, DRONAHQ_AGENT_*

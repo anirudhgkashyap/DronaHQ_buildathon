@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New Campaign · Atlas SDR</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-campaigns" viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5-9-5Z"/><path d="m3 13 9 5 9-5"/></symbol>
+  <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4V5Z"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M19 12H5M12 5l-7 7 7 7"/></symbol>
+</svg>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="sidebar__top">
+      <div class="brand">
+        <svg class="brand__mark" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="8" fill="#3446d6"/><rect x="6" y="8" width="16" height="3" rx="1.5" fill="#fff"/><rect x="8.5" y="13.5" width="11" height="3" rx="1.5" fill="#fff"/><rect x="11" y="19" width="6" height="3" rx="1.5" fill="#fff"/></svg>
+        <div><div class="brand__name">Atlas SDR</div><div class="brand__sub">Control plane</div></div>
+      </div>
+      <nav class="nav" aria-label="Main">
+        <a class="nav__link nav__link--active" href="campaigns.html" aria-current="page"><svg class="icon nav__icon"><use href="#i-campaigns"/></svg>Campaigns</a>
+        <a class="nav__link" href="conversations.html"><svg class="icon nav__icon"><use href="#i-inbox"/></svg>Conversations<span class="nav__badge" data-badge="approvals" aria-label="pending approvals"></span></a>
+        <a class="nav__link" href="settings.html"><svg class="icon nav__icon"><use href="#i-settings"/></svg>Global settings</a>
+      </nav>
+    </div>
+    <div class="ks" data-killswitch>
+      <div class="ks__title" data-ks-title>Global kill switch</div>
+      <p class="ks__text" data-ks-text>Stops every agent on every campaign and channel.</p>
+      <button type="button" class="btn btn--danger btn--sm" data-ks-button>Stop all activity</button>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar__breadcrumb">
+        <a href="campaigns.html" class="topbar__back"><svg class="icon"><use href="#i-back"/></svg>Campaigns</a>
+        <span class="topbar__sep">/</span>
+        <span id="wizard-title">New campaign</span>
+      </div>
+      <div class="topbar__actions"><span class="avatar" data-user-avatar title="Signed in" aria-hidden="true"></span></div>
+    </header>
+    <main class="content" id="content">
+      <div data-slot="platform-banner"></div>
+      <div class="wizard-progress" aria-label="Wizard progress">
+        <div class="wizard-steps" id="wizard-steps">
+          <div class="wizard-step wizard-step--active" data-step="1"><div class="wizard-step__num">1</div><div class="wizard-step__label">Basics</div></div>
+          <div class="wizard-step__connector"></div>
+          <div class="wizard-step" data-step="2"><div class="wizard-step__num">2</div><div class="wizard-step__label">ICP</div></div>
+          <div class="wizard-step__connector"></div>
+          <div class="wizard-step" data-step="3"><div class="wizard-step__num">3</div><div class="wizard-step__label">Outreach</div></div>
+        </div>
+        <div class="wizard-progress__bar"><div class="wizard-progress__fill" id="progress-fill" style="width:33%"></div></div>
+      </div>
+      <section class="panel wizard-panel" id="step-1">
+        <div class="panel__head"><div><h2>Campaign basics</h2><div class="panel__sub">Name and goal for this campaign.</div></div></div>
+        <div class="form-grid">
+          <div class="field field--full"><label class="label" for="f-name">Campaign name <span class="required">*</span></label><input class="input" type="text" id="f-name" placeholder="e.g. US SaaS · CTO Outreach" autocomplete="off" required><div class="field__hint">Choose a name you'll recognise in the list.</div></div>
+          <div class="field field--full"><label class="label" for="f-desc">Description</label><textarea class="input input--textarea" id="f-desc" rows="3" placeholder="What is this campaign trying to achieve?"></textarea></div>
+          <div class="field"><label class="label" for="f-goal">Goal <span class="required">*</span></label><select class="select" id="f-goal"><option value="">Select a goal</option><option value="generate_leads">Generate leads</option><option value="book_meetings">Book meetings</option><option value="nurture">Nurture existing prospects</option></select></div>
+          <div class="field"><label class="label" for="f-start">Start date</label><input class="input" type="date" id="f-start"></div>
+          <div class="field"><label class="label" for="f-owner">Owner</label><select class="select" id="f-owner"><option value="usr_mr">M. Rao</option><option value="usr_ai">A. Iyer</option><option value="usr_sm">S. Menon</option></select></div>
+        </div>
+      </section>
+      <section class="panel wizard-panel" id="step-2" hidden>
+        <div class="panel__head"><div><h2>Ideal Customer Profile (ICP)</h2><div class="panel__sub">Define who you want to reach.</div></div></div>
+        <div class="form-grid">
+          <div class="field field--full"><div class="label">Target industries</div><div class="checkbox-grid" id="industries-grid"><label class="checkbox-label"><input type="checkbox" name="industry" value="SaaS"> SaaS</label><label class="checkbox-label"><input type="checkbox" name="industry" value="FinTech"> FinTech</label><label class="checkbox-label"><input type="checkbox" name="industry" value="BFSI"> BFSI</label><label class="checkbox-label"><input type="checkbox" name="industry" value="HealthTech"> HealthTech</label><label class="checkbox-label"><input type="checkbox" name="industry" value="EdTech"> EdTech</label><label class="checkbox-label"><input type="checkbox" name="industry" value="E-commerce"> E-commerce</label><label class="checkbox-label"><input type="checkbox" name="industry" value="Manufacturing"> Manufacturing</label><label class="checkbox-label"><input type="checkbox" name="industry" value="Logistics"> Logistics</label><label class="checkbox-label"><input type="checkbox" name="industry" value="AI/ML"> AI / ML</label><label class="checkbox-label"><input type="checkbox" name="industry" value="Cybersecurity"> Cybersecurity</label></div></div>
+          <div class="field"><label class="label" for="f-emp-min">Min employees</label><input class="input" type="number" id="f-emp-min" placeholder="e.g. 50" min="1"></div>
+          <div class="field"><label class="label" for="f-emp-max">Max employees</label><input class="input" type="number" id="f-emp-max" placeholder="e.g. 5000" min="1"></div>
+          <div class="field field--full"><div class="label">Seniority levels</div><div class="checkbox-grid"><label class="checkbox-label"><input type="checkbox" name="seniority" value="C-suite"> C-suite (CEO, CTO, CFO…)</label><label class="checkbox-label"><input type="checkbox" name="seniority" value="VP"> VP / SVP</label><label class="checkbox-label"><input type="checkbox" name="seniority" value="Director"> Director</label><label class="checkbox-label"><input type="checkbox" name="seniority" value="Manager"> Manager</label><label class="checkbox-label"><input type="checkbox" name="seniority" value="IC"> Individual contributor</label></div></div>
+          <div class="field field--full"><label class="label" for="f-keywords">Keywords / signals</label><input class="input" type="text" id="f-keywords" placeholder="e.g. hiring engineers, Series B, DTC, PLG"><div class="field__hint">Comma-separated keywords the agent uses to find matching companies.</div></div>
+          <div class="field"><label class="label" for="f-funding">Funding stage</label><select class="select" id="f-funding"><option value="">Any</option><option value="seed">Seed</option><option value="series_a">Series A</option><option value="series_b">Series B</option><option value="series_c">Series C+</option><option value="public">Public</option></select></div>
+          <div class="field"><label class="label" for="f-geo">Geography</label><input class="input" type="text" id="f-geo" placeholder="e.g. US, India, UK"></div>
+        </div>
+      </section>
+      <section class="panel wizard-panel" id="step-3" hidden>
+        <div class="panel__head"><div><h2>Outreach settings</h2><div class="panel__sub">Channels, limits, and sequence steps.</div></div></div>
+        <div class="form-grid">
+          <div class="field field--full"><div class="label">Channels</div><div class="checkbox-grid"><label class="checkbox-label"><input type="checkbox" name="channel" value="email" checked> Email</label><label class="checkbox-label"><input type="checkbox" name="channel" value="linkedin"> LinkedIn</label><label class="checkbox-label"><input type="checkbox" name="channel" value="sms"> SMS</label></div></div>
+          <div class="field"><label class="label" for="f-daily-limit">Daily send limit</label><input class="input" type="number" id="f-daily-limit" value="50" min="1" max="500"><div class="field__hint">Max outreach touches per day across all channels.</div></div>
+          <div class="field"><label class="label" for="f-timezone">Sending timezone</label><select class="select" id="f-timezone"><option value="America/New_York">Eastern (ET)</option><option value="America/Chicago">Central (CT)</option><option value="America/Los_Angeles">Pacific (PT)</option><option value="Europe/London">London (GMT/BST)</option><option value="Asia/Kolkata">India (IST)</option><option value="Asia/Singapore">Singapore (SGT)</option></select></div>
+          <div class="field field--full"><div class="label">Sequence steps</div><div class="panel__sub" style="margin-bottom:12px">Define the outreach flow. Steps are executed in order.</div><div id="sequence-builder"></div><div class="sequence-add-row"><button type="button" class="btn btn--ghost btn--sm" id="add-email-step"><svg class="icon"><use href="#i-plus"/></svg>Add email</button><button type="button" class="btn btn--ghost btn--sm" id="add-delay-step"><svg class="icon"><use href="#i-plus"/></svg>Add delay</button></div></div>
+          <div class="field"><label class="label" for="f-approval-threshold">Approval threshold</label><select class="select" id="f-approval-threshold"><option value="0.7">Stop if confidence &lt; 70%</option><option value="0.8">Stop if confidence &lt; 80%</option><option value="0.9">Stop if confidence &lt; 90%</option><option value="0">Never require approval</option></select></div>
+          <div class="field"><div class="label">Dry run mode</div><label class="toggle"><input type="checkbox" id="f-dry-run"><span class="toggle__track"></span><span class="toggle__label">Run without sending real messages</span></label></div>
+        </div>
+      </section>
+      <div class="wizard-nav" id="wizard-nav">
+        <button type="button" class="btn btn--secondary" id="btn-back" hidden>Back</button>
+        <div class="wizard-nav__right">
+          <a href="campaigns.html" class="btn btn--ghost">Cancel</a>
+          <button type="button" class="btn btn--primary" id="btn-next">Next</button>
+          <button type="button" class="btn btn--primary" id="btn-create" hidden><svg class="icon"><use href="#i-campaigns"/></svg>Create campaign</button>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+<script src="js/config.js" defer></script>
+<script src="js/mock-data.js" defer></script>
+<script src="js/api.js" defer></script>
+<script src="js/shell.js" defer></script>
+<script src="js/campaign-new.js" defer></script>
+</body>
+</html>
