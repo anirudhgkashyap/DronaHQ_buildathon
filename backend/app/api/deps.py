@@ -44,11 +44,18 @@ DEMO_MANAGER = {
 async def _seeded_manager(session: AsyncSession) -> User:
     """The account every unauthenticated request acts as.
 
-    Prefers a real manager row (the seed script creates one), falls back to any
-    user, and only creates ``usr_sm`` when the table is genuinely empty. That
-    last branch exists so a fresh database still serves ``GET /me`` instead of
-    500-ing on the very first page load of the demo.
+    Prefers the account owner (an ``admin`` row, created first by the seed
+    script), falls back to a manager, then to any user, and only creates
+    ``usr_sm`` when the table is genuinely empty. That last branch exists so a
+    fresh database still serves ``GET /me`` instead of 500-ing on the very
+    first page load of the demo.
     """
+    admin = (
+        await session.execute(select(User).where(User.role == "admin").order_by(User.created_at))
+    ).scalars().first()
+    if admin:
+        return admin
+
     manager = (
         await session.execute(select(User).where(User.role == "manager").order_by(User.created_at))
     ).scalars().first()

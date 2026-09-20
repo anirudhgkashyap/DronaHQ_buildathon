@@ -140,8 +140,20 @@ async def list_prospects(
         )
     ).scalars().all()
 
+    def with_flat_fields(p: Prospect) -> dict:
+        item = serialize_prospect(p)
+        # Frontend convenience fields: the prospects table renders these flat
+        # keys directly rather than reaching into `company` or renaming
+        # `fit_score`/`designation`.
+        item["name"] = p.full_name
+        item["title"] = p.designation
+        item["company"] = p.company.name if p.company else None
+        item["score"] = p.fit_score
+        item["last_activity"] = iso(p.last_contacted_at or p.updated_at or p.created_at)
+        return item
+
     return {
-        "items": [serialize_prospect(p) for p in prospects],
+        "items": [with_flat_fields(p) for p in prospects],
         "total": total,
         "limit": clamp(limit, 50, 200),
         "offset": offset,

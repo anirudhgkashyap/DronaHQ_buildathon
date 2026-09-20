@@ -4,16 +4,18 @@ Lifespan:
   startup  → init_models() creates/migrates tables, starts background scheduler
   shutdown → scheduler cancelled cleanly
 
-Routers are mounted at /api/v1/* to match the frontend’s documented contract.
+Routers are mounted at /api/v1/* to match the frontend's documented contract.
 CORS is wide-open for the hackathon demo; tighten origins= in production.
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import init_models, session_scope
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── startup ──────────────────────────────────────────────────────────────
+    # ── startup ──────────────────────────────────────────────────────────
     logger.info("Atlas SDR starting — environment: %s", settings.DATABASE_URL[:40])
     await init_models()
     logger.info("Database tables ready")
@@ -73,7 +75,7 @@ async def lifespan(app: FastAPI):
 
     yield  # application is live
 
-    # ── shutdown ──────────────────────────────────────────────────────────────
+    # ── shutdown ─────────────────────────────────────────────────────────
     await sched.stop()
     logger.info("Atlas SDR shutdown complete")
 
@@ -90,7 +92,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS ─────────────────────────────────────────────────────────────────────────────────────
+# ── CORS ─────────────────────────────────────────────────────────────────────
 # Wide open for the hackathon demo.  Restrict in production.
 app.add_middleware(
     CORSMiddleware,
@@ -100,10 +102,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Error handlers ─────────────────────────────────────────────────────────────────────────────────
+# ── Error handlers ────────────────────────────────────────────────────────────
 install_error_handlers(app)
 
-# ── Routers ─────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Routers ───────────────────────────────────────────────────────────────────
 PREFIX = "/api/v1"
 
 app.include_router(campaigns.router,    prefix=PREFIX)
@@ -117,7 +119,7 @@ app.include_router(knowledge.router,    prefix=PREFIX)
 app.include_router(metrics.router,      prefix=PREFIX)
 
 
-# ── Health check ─────────────────────────────────────────────────────────────────────────────────
+# ── Health check ──────────────────────────────────────────────────────────────
 @app.get("/health", tags=["meta"])
 async def health() -> dict:
     return {
@@ -127,7 +129,24 @@ async def health() -> dict:
     }
 
 
-# ── Dev entrypoint ──────────────────────────────────────────────────────────────────────────────────
+# ── Frontend (static SPA) ───────────────────────────────────────────────────────
+# Serves the plain-JS frontend from the sibling `front_end/` directory so the
+# whole app — API + UI — is one Render service on one URL. This must be the
+# LAST thing mounted: StaticFiles at "/" is a catch-all and would otherwise
+# shadow the /api/v1/* and /health routes registered above.
+#
+# `front_end/js/config.js` already defaults API_BASE_URL to `/api/v1`, which is
+# correct as long as the frontend is served from this same origin (as it is
+# here). If the frontend is instead deployed separately (its own static host),
+# set `window.ATLAS_API_URL` to this backend's full URL before config.js loads.
+_FRONTEND_DIR = Path(__file__).resolve().parent.parent / "front_end"
+if _FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
+else:
+    logger.warning("Frontend directory not found at %s — serving API only", _FRONTEND_DIR)
+
+
+# ── Dev entrypoint ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
 

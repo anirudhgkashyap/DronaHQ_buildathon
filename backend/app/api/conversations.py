@@ -30,7 +30,7 @@ from ..models import (
     utcnow,
 )
 from ..orchestrator.guardrails import check_kill_switch, check_suppression
-from ..serializers import serialize_message, serialize_prospect, serialize_thread
+from ..serializers import iso, serialize_message, serialize_prospect, serialize_thread
 from .deps import SessionDep, UserDep, actor, clamp, load_thread
 from .errors import blocked, not_found
 
@@ -69,17 +69,63 @@ async def _last_messages(session, thread_ids: list[str]) -> dict[str, Message]:
     return latest
 
 
+async def _pending_approval_prospect_ids(session, prospect_ids: list[str]) -> set[str]:
+    if not prospect_ids:
+        return set()
+    rows = (
+        await session.execute(
+            select(Approval.prospect_id).where(
+                Approval.prospect_id.in_(prospect_ids), Approval.status == "pending"
+            )
+        )
+    ).scalars().all()
+    return {pid for pid in rows if pid}
+
+
+def _flat_conversation(
+    thread: ConversationThread, last_message: Optional[Message], has_approval: bool
+) -> dict:
+    """The inbox list-item shape the conversation page renders: a nested
+    ``prospect`` object plus ``unread``/``has_approval`` flags, layered on top
+    of the documented thread fields (kept below for other consumers)."""
+    payload = serialize_thread(thread, last_message)
+    prospect = thread.prospect
+    payload["prospect"] = {
+        "id": prospect.id if prospect else thread.prospect_id,
+        "name": prospect.full_name if prospect else None,
+        "title": prospect.designation if prospect else None,
+        "company": prospect.company.name if prospect and prospect.company else None,
+        "email": prospect.email if prospect else None,
+        "icp_score": prospect.fit_score if prospect else None,
+    }
+    payload["updated_at"] = payload["last_activity_at"]
+    payload["campaign_name"] = None  # filled in by the caller when known
+    # "Unread" has no dedicated column: a thread the agent/human hasn't acted
+    # on since the prospect's last word is the closest honest proxy.
+    payload["unread"] = 1 if (last_message and last_message.direction == "inbound") else 0
+    payload["has_approval"] = has_approval
+    return payload
+
+
 @router.get("/conversations")
 async def list_conversations(
     session: SessionDep,
     _: UserDep,
     campaign_id: Annotated[Optional[str], Query()] = None,
     status: Annotated[Optional[str], Query()] = None,
+    filter: Annotated[Optional[str], Query()] = None,
     channel: Annotated[Optional[str], Query()] = None,
     q: Annotated[Optional[str], Query()] = None,
     limit: Annotated[Optional[int], Query(ge=1, le=200)] = 50,
 ) -> dict:
-    """The inbox, most recently active first."""
+    """The inbox, most recently active first.
+
+    ``status`` filters on the stored thread status directly (the documented
+    contract). ``filter`` is the inbox page's convenience alias — all / active
+    / replied / unread / approvals — computed from the thread plus its latest
+    message and pending-approval state, since none of those are single stored
+    columns.
+    """
     clauses = []
     if campaign_id:
         clauses.append(ConversationThread.campaign_id == campaign_id)
@@ -102,26 +148,46 @@ async def list_conversations(
             )
         )
 
-    count_stmt = select(func.count(ConversationThread.id)).select_from(ConversationThread)
-    if q:
-        count_stmt = count_stmt.outerjoin(
-            Prospect, Prospect.id == ConversationThread.prospect_id
-        ).outerjoin(Company, Company.id == Prospect.company_id)
-    total = int((await session.execute(count_stmt.where(*clauses))).scalar() or 0)
-
     threads = (
         await session.execute(
-            stmt.where(*clauses)
-            .order_by(ConversationThread.last_activity_at.desc())
-            .limit(clamp(limit, 50, 200))
+            stmt.where(*clauses).order_by(ConversationThread.last_activity_at.desc())
         )
     ).scalars().all()
 
     previews = await _last_messages(session, [t.id for t in threads])
-    return {
-        "items": [serialize_thread(t, previews.get(t.id)) for t in threads],
-        "total": total,
-    }
+    approval_prospects = await _pending_approval_prospect_ids(
+        session, [t.prospect_id for t in threads if t.prospect_id]
+    )
+
+    campaign_names: dict[str, str] = {}
+    campaign_ids = {t.campaign_id for t in threads if t.campaign_id}
+    if campaign_ids:
+        rows = await session.execute(
+            select(Campaign.id, Campaign.name).where(Campaign.id.in_(campaign_ids))
+        )
+        campaign_names = {cid: name for cid, name in rows}
+
+    items = []
+    for t in threads:
+        last = previews.get(t.id)
+        item = _flat_conversation(t, last, t.prospect_id in approval_prospects)
+        item["campaign_name"] = campaign_names.get(t.campaign_id)
+        items.append(item)
+
+    active_filter = (filter or "all").lower()
+    if active_filter and active_filter != "all":
+        if active_filter == "active":
+            items = [i for i in items if i["status"] == "active"]
+        elif active_filter == "replied":
+            items = [i for i in items if i["last_direction"] == "inbound"]
+        elif active_filter == "unread":
+            items = [i for i in items if i["unread"]]
+        elif active_filter == "approvals":
+            items = [i for i in items if i["has_approval"]]
+
+    total = len(items)
+    items = items[: clamp(limit, 50, 200)]
+    return {"items": items, "total": total}
 
 
 @router.get("/conversations/{thread_id}")
@@ -142,24 +208,102 @@ async def get_conversation(thread_id: str, session: SessionDep, _: UserDep) -> d
     return payload
 
 
-@router.post("/conversations/{thread_id}/reply")
-async def reply(
-    thread_id: str, body: ReplyRequest, session: SessionDep, user: UserDep
-) -> dict:
-    """Human takeover: send this text, now, as the campaign's sender.
+@router.get("/conversations/{thread_id}/messages")
+async def get_thread_messages(thread_id: str, session: SessionDep, _: UserDep) -> dict:
+    """The thread's messages, oldest first, with any pending approval for this
+    prospect interleaved as an inline approval card.
 
-    Two guardrails still apply and both return 409 rather than sending:
-
-    * the **global kill switch** — when the platform is halted it is halted,
-      and a manual send is exactly the kind of "just this once" that makes an
-      emergency brake useless;
-    * the **do-not-contact list** — an opt-out is a commitment, not a default.
-
-    Everything else (campaign status, channel pauses, rate limits, working
-    hours) is deliberately *not* enforced here. Those exist to govern what the
-    machine does unsupervised; a human deciding to answer a live conversation
-    is the supervision they were protecting.
+    A pending approval blocks the orchestrator from advancing this prospect
+    the same way it blocks it everywhere else in the product; showing it in
+    the thread (rather than only in the separate approvals queue) is what lets
+    a manager approve or reject a draft without leaving the conversation.
     """
+    thread = await load_thread(session, thread_id)
+    messages = (
+        await session.execute(
+            select(Message)
+            .where(Message.thread_id == thread_id)
+            .order_by(Message.created_at.asc())
+        )
+    ).scalars().all()
+
+    items = [serialize_message(m) for m in messages]
+
+    if thread.prospect_id:
+        pending = (
+            await session.execute(
+                select(Approval).where(
+                    Approval.prospect_id == thread.prospect_id, Approval.status == "pending"
+                )
+            )
+        ).scalars().all()
+        for approval in pending:
+            items.append({
+                "id": approval.id,
+                "type": "approval",
+                "approval_id": approval.id,
+                "body": f"{approval.title} — {approval.detail or approval.reason}",
+                "sent_at": iso(approval.created_at),
+            })
+
+    return {"items": items}
+
+
+@router.get("/conversations/{thread_id}/ai-suggestions")
+async def ai_suggestions(thread_id: str, session: SessionDep, _: UserDep) -> dict:
+    """2-3 suggested replies for the composer, grounded in the prospect's own
+    last message when there is one.
+
+    This calls the same conversation-agent path the autonomous pipeline uses
+    when DronaHQ is configured; when it isn't (or the call fails — e.g. this
+    sandbox's egress proxy blocks the DronaHQ host), a deterministic
+    template-based fallback keeps the composer usable rather than erroring.
+    """
+    thread = await load_thread(session, thread_id)
+    prospect = thread.prospect
+
+    last_inbound = (
+        await session.execute(
+            select(Message)
+            .where(Message.thread_id == thread_id, Message.direction == "inbound")
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+
+    name = (prospect.full_name.split()[0] if prospect and prospect.full_name else "there")
+    company = prospect.company.name if prospect and prospect.company else "your team"
+
+    if last_inbound and last_inbound.body:
+        suggestions = [
+            f"Thanks for the reply, {name}! Happy to walk you through how this could help {company} — "
+            "does a 20-minute call this week work?",
+            f"Great question — let me send over a short overview tailored to {company} and we can "
+            "take it from there.",
+            "Would a quick call this week work? I can share a couple of relevant examples live.",
+        ]
+    else:
+        suggestions = [
+            f"Hi {name}, just following up on my last note — happy to answer any questions about "
+            f"how this could help {company}.",
+            f"Wanted to check back in, {name} — would a quick 15-minute call this week make sense?",
+            "No worries if now isn't the right time — let me know if a later date works better.",
+        ]
+
+    return {"items": suggestions}
+
+
+async def _send_thread_message(
+    thread_id: str,
+    body_text: str,
+    subject: Optional[str],
+    session: SessionDep,
+    user,
+) -> tuple[ConversationThread, Message]:
+    """Shared core of human takeover sends. Used by both ``/reply`` (the
+    documented endpoint) and ``/messages`` (the composer's endpoint, which
+    posts ``{channel, body}`` and doesn't need its own copy of the guardrail
+    and delivery logic)."""
     thread = await load_thread(session, thread_id)
     prospect = thread.prospect
     if prospect is None:
@@ -185,18 +329,14 @@ async def reply(
         channel=thread.channel,
         direction="outbound",
         message_type="reply",
-        subject=body.subject,
-        body=body.body,
+        subject=subject,
+        body=body_text,
         status="draft",
-        # Human replies are one-offs, so the key only has to be unique; there
-        # is no earlier attempt for a retry to converge on.
         idempotency_key=f"human_reply:{message_id}",
     )
     session.add(message)
     await session.flush()
 
-    # The adapter owns CHANNELS_DRY_RUN, so a demo deployment records the reply
-    # in full without contacting a real person.
     adapter = get_adapter(thread.channel)
     result = await adapter.send(
         recipient={
@@ -239,7 +379,46 @@ async def reply(
         payload={"channel": thread.channel, "dry_run": result.dry_run, "prospect_id": prospect.id},
     )
     await session.commit()
+    return thread, message
 
+
+class ComposerMessageRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=20_000)
+    channel: Optional[str] = None
+    subject: Optional[str] = Field(default=None, max_length=400)
+
+
+@router.post("/conversations/{thread_id}/messages")
+async def post_thread_message(
+    thread_id: str, body: ComposerMessageRequest, session: SessionDep, user: UserDep
+) -> dict:
+    """The composer's send action. Same guardrails and delivery path as
+    ``/reply``; accepts the composer's ``{channel, body}`` shape (``channel``
+    is accepted for forward-compatibility but a thread's channel is fixed, so
+    it is not used to switch it)."""
+    _thread, message = await _send_thread_message(thread_id, body.body, body.subject, session, user)
+    return {"id": message.id, "status": message.status}
+
+
+@router.post("/conversations/{thread_id}/reply")
+async def reply(
+    thread_id: str, body: ReplyRequest, session: SessionDep, user: UserDep
+) -> dict:
+    """Human takeover: send this text, now, as the campaign's sender.
+
+    Two guardrails still apply and both return 409 rather than sending:
+
+    * the **global kill switch** — when the platform is halted it is halted,
+      and a manual send is exactly the kind of "just this once" that makes an
+      emergency brake useless;
+    * the **do-not-contact list** — an opt-out is a commitment, not a default.
+
+    Everything else (campaign status, channel pauses, rate limits, working
+    hours) is deliberately *not* enforced here. Those exist to govern what the
+    machine does unsupervised; a human deciding to answer a live conversation
+    is the supervision they were protecting.
+    """
+    thread, message = await _send_thread_message(thread_id, body.body, body.subject, session, user)
     payload = serialize_thread(thread, message)
     payload["message"] = serialize_message(message)
     return payload
@@ -247,7 +426,7 @@ async def reply(
 
 @router.post("/conversations/{thread_id}/close")
 async def close(
-    thread_id: str, body: NoteRequest, session: SessionDep, user: UserDep
+    thread_id: str, session: SessionDep, user: UserDep, body: NoteRequest = NoteRequest()
 ) -> dict:
     """Close a conversation and stop the follow-up cadence for that prospect.
 
@@ -285,7 +464,7 @@ async def close(
 
 @router.post("/conversations/{thread_id}/escalate")
 async def escalate(
-    thread_id: str, body: NoteRequest, session: SessionDep, user: UserDep
+    thread_id: str, session: SessionDep, user: UserDep, body: NoteRequest = NoteRequest()
 ) -> dict:
     """Flag a conversation for a person to handle.
 

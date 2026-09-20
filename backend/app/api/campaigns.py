@@ -24,7 +24,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import audit
-from ..agents.schemas import CAMPAIGN_SYSTEM_PROMPT, default_prompt
+from ..agents.schemas import AGENT_LABELS, CAMPAIGN_SYSTEM_PROMPT, default_prompt
 from ..channels.registry import SUPPORTED_CHANNELS
 from ..db import new_id
 from ..models import (
@@ -36,6 +36,7 @@ from ..models import (
     Campaign,
     CampaignChannel,
     CampaignRep,
+    Company,
     ConversationThread,
     Message,
     PromptVersion,
@@ -44,8 +45,8 @@ from ..models import (
     utcnow,
 )
 from ..orchestrator.engine import discover_prospects, tick_campaign
-from ..serializers import serialize_campaign, serialize_campaign_detail, user_ref
-from .deps import SessionDep, UserDep, actor, load_campaign, require_choice, steps_json
+from ..serializers import iso, serialize_campaign, serialize_campaign_detail, user_ref
+from .deps import SessionDep, UserDep, actor, clamp, load_campaign, require_choice, steps_json
 from .errors import ApiError, invalid_request, invalid_state, invalid_transition, not_found
 
 router = APIRouter(tags=["campaigns"])
@@ -519,7 +520,7 @@ async def get_campaign(campaign_id: str, session: SessionDep, _: UserDep) -> dic
         for rep in rep_rows
     ]
 
-    return serialize_campaign_detail(
+    payload = serialize_campaign_detail(
         campaign,
         metrics=metrics,
         funnel=funnel,
@@ -528,12 +529,129 @@ async def get_campaign(campaign_id: str, session: SessionDep, _: UserDep) -> dic
         outcomes=outcomes,
         reps=reps,
     )
+    # Frontend convenience fields: the dashboard header reads these directly
+    # off `metrics` rather than cross-referencing `outcomes`.
+    payload["metrics"]["contacted"] = metrics["outreach"]
+    payload["metrics"]["replies"] = outcomes["replied_prospects"]
+    payload["metrics"]["reply_rate"] = outcomes["reply_rate"] or 0
+    # No open-tracking pixel is implemented, so this is not a real open rate —
+    # it is delivered-vs-sent, which is the closest honest proxy available.
+    payload["metrics"]["open_rate"] = 0
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Campaign-scoped approvals and agent runs (flat, frontend-facing shapes)
+# ---------------------------------------------------------------------------
+@router.get("/campaigns/{campaign_id}/approvals")
+async def campaign_approvals(
+    campaign_id: str,
+    session: SessionDep,
+    _: UserDep,
+    status: Annotated[str, Query()] = "pending",
+    limit: Annotated[Optional[int], Query(ge=1, le=200)] = 50,
+) -> dict:
+    """This campaign's approval queue, in the flat shape the campaign
+    dashboard's approvals tab renders (prospect name/company inlined rather
+    than requiring a second round trip per row)."""
+    await load_campaign(session, campaign_id)
+    clauses = [Approval.campaign_id == campaign_id]
+    if status and status != "all":
+        clauses.append(Approval.status == status)
+
+    rows = (
+        await session.execute(
+            select(Approval, Prospect, Company)
+            .outerjoin(Prospect, Prospect.id == Approval.prospect_id)
+            .outerjoin(Company, Company.id == Prospect.company_id)
+            .where(*clauses)
+            .order_by(Approval.created_at.desc())
+            .limit(clamp(limit, 50, 200))
+        )
+    ).all()
+
+    return {
+        "items": [
+            {
+                "id": approval.id,
+                "campaign_id": approval.campaign_id,
+                "prospect_id": approval.prospect_id,
+                "title": approval.title,
+                "reason": approval.reason,
+                "detail": approval.detail,
+                "status": approval.status,
+                "prospect_name": prospect.full_name if prospect else None,
+                "prospect_company": company.name if company else None,
+                "created_at": iso(approval.created_at),
+            }
+            for approval, prospect, company in rows
+        ]
+    }
+
+
+_AGENT_RUN_STATUS_MAP = {
+    "succeeded": "success",
+    "failed": "error",
+    "running": "running",
+    "pending": "running",
+    "skipped": "success",
+}
+
+
+@router.get("/campaigns/{campaign_id}/agent-runs")
+async def campaign_agent_runs(
+    campaign_id: str,
+    session: SessionDep,
+    _: UserDep,
+    limit: Annotated[Optional[int], Query(ge=1, le=200)] = 50,
+) -> dict:
+    """Recent agent invocations for this campaign, newest first, in the flat
+    shape the dashboard's activity feed renders."""
+    await load_campaign(session, campaign_id)
+    rows = (
+        await session.execute(
+            select(AgentRun)
+            .where(AgentRun.campaign_id == campaign_id)
+            .order_by(AgentRun.started_at.desc())
+            .limit(clamp(limit, 50, 200))
+        )
+    ).scalars().all()
+
+    def summary_for(run: AgentRun) -> str:
+        if run.error:
+            return run.error
+        if isinstance(run.output, dict) and run.output.get("summary"):
+            return str(run.output["summary"])
+        return f"{AGENT_LABELS.get(run.agent_key, run.agent_key)} run {run.status}."
+
+    def duration_ms(run: AgentRun) -> int:
+        if run.latency_ms:
+            return int(run.latency_ms)
+        if run.started_at and run.finished_at:
+            return int((run.finished_at - run.started_at).total_seconds() * 1000)
+        return 0
+
+    return {
+        "items": [
+            {
+                "id": run.id,
+                "agent": AGENT_LABELS.get(run.agent_key, run.agent_key),
+                "agent_key": run.agent_key,
+                "status": _AGENT_RUN_STATUS_MAP.get(run.status, run.status),
+                "summary": summary_for(run),
+                "started_at": iso(run.started_at),
+                "duration_ms": duration_ms(run),
+            }
+            for run in rows
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
 # Update
 # ---------------------------------------------------------------------------
 @router.patch("/campaigns/{campaign_id}")
+@router.put("/campaigns/{campaign_id}")
 async def update_campaign(
     campaign_id: str,
     body: CampaignUpdate,

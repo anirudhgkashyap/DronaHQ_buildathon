@@ -143,6 +143,34 @@
     };
   }
 
+  /* ---- transform wizard data into the backend's CampaignCreate/Update shape ----
+     The wizard's own collectData() shape (icp/outreach nested, channels as a
+     flat list of type strings) is convenient for the form; the backend's
+     Campaign model wants channels as full {type,state,daily_limit,config}
+     objects and policy fields flattened into a single `policies` dict. */
+  function buildBackendPayload(data, forCreate) {
+    var payload = {
+      name: data.name,
+      description: data.description || null,
+      icp: data.icp || {},
+      objective: data.goal || null,
+      policies: {
+        daily_limit: data.outreach.daily_limit,
+        approval_threshold: data.outreach.approval_threshold,
+        dry_run: data.outreach.dry_run,
+        timezone: data.outreach.timezone,
+        sequence: data.outreach.sequence
+      }
+    };
+    if (data.owner_id) payload.owner_id = data.owner_id;
+    if (forCreate) {
+      payload.channels = (data.outreach.channels || []).map(function (type) {
+        return { type: type, state: "active", daily_limit: data.outreach.daily_limit || 50, config: {} };
+      });
+    }
+    return payload;
+  }
+
   /* ---- create / update ---- */
   async function submitCampaign() {
     var btn = document.getElementById("btn-create");
@@ -151,7 +179,18 @@
       var data = collectData();
       var editId = new URLSearchParams(location.search).get("id");
       if (editId) {
-        await A.api.request("PUT", "/campaigns/" + encodeURIComponent(editId), { body: data });
+        /* This wizard does not (yet) preload the campaign's existing ICP,
+           channels, or policy fields when opened for editing — the form
+           starts from its own defaults. Sending those defaults as-is would
+           silently overwrite the campaign's real configuration, and sending
+           `icp` at all on a *live* campaign is refused by the backend unless
+           explicitly forced (changing the ICP of a live campaign re-scores
+           prospects mid-flight). So an edit here only updates name,
+           description, objective, owner and the outreach-policy fields the
+           wizard actually presents — ICP and channels are left untouched. */
+        var editPayload = buildBackendPayload(data, false);
+        delete editPayload.icp;
+        await A.api.request("PUT", "/campaigns/" + encodeURIComponent(editId), { body: editPayload });
         window.location.href = Atlas.config.ROUTES.campaign(editId);
       } else {
         /* mock: just redirect to campaigns list */
@@ -160,7 +199,8 @@
           window.location.href = Atlas.config.ROUTES.campaigns;
           return;
         }
-        var res = await A.api.request("POST", "/campaigns", { body: data });
+        var createPayload = buildBackendPayload(data, true);
+        var res = await A.api.request("POST", "/campaigns", { body: createPayload });
         window.location.href = Atlas.config.ROUTES.campaign(res.id);
       }
     } catch (e) {

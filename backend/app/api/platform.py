@@ -8,23 +8,27 @@ switch, suppression, channel and campaign pauses live next door).
 """
 from __future__ import annotations
 
+import time
 from typing import Annotated, Any, Literal, Optional
 
+import httpx
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, or_, select
 
 from .. import audit
+from ..agents.client import AGENT_ID_SETTINGS, resolve_dronahq_agent_id
+from ..agents.schemas import AGENT_LABELS
 from ..config import settings
 from ..db import new_id
-from ..models import AuditLog, Campaign, Prospect, SuppressionEntry, User, utcnow
+from ..models import AuditLog, Campaign, PlatformSetting, Prospect, SuppressionEntry, User, utcnow
 from ..orchestrator import scheduler
 from ..orchestrator.engine import handle_inbound
 from ..orchestrator.guardrails import get_kill_switch, set_kill_switch
 from ..rag.embedder import EMBEDDER_NAME
 from ..serializers import iso, serialize_event, serialize_user
 from .deps import SessionDep, UserDep, actor, clamp, load_prospect, step_json
-from .errors import invalid_request, not_found
+from .errors import ApiError, invalid_request, not_found
 
 router = APIRouter(tags=["platform"])
 
@@ -405,6 +409,213 @@ async def inbound(body: InboundWebhook, session: SessionDep, _: UserDep) -> dict
     )
     await session.commit()
     return step_json(result)
+
+
+# ---------------------------------------------------------------------------
+# Settings (the global settings page)
+# ---------------------------------------------------------------------------
+# PlatformSetting is a single-row-per-key JSON store; these are the keys the
+# settings page reads and writes. Everything else on /platform/settings
+# (above) is derived/read-only integration status, not user-editable config.
+_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "company_name": {"value": "Atlas SDR"},
+    "timezone": {"value": "Asia/Kolkata"},
+    "working_hours": {"start": "09:00", "end": "18:00"},
+    "working_days": {"days": ["mon", "tue", "wed", "thu", "fri"]},
+    "global_daily_send_cap": {"value": 500},
+    "dry_run": {"value": settings.CHANNELS_DRY_RUN},
+    "channels": {
+        "email": {"from_email": settings.OUTREACH_FROM_EMAIL, "from_name": "Atlas SDR", "reply_to": ""},
+        "sms": {"number": ""},
+        "linkedin": {"daily_limit": 20},
+    },
+}
+
+
+async def _get_setting(session, key: str) -> Any:
+    row = await session.get(PlatformSetting, key)
+    return row.value if row else _SETTINGS_DEFAULTS.get(key)
+
+
+async def _put_setting(session, key: str, value: Any) -> None:
+    row = await session.get(PlatformSetting, key)
+    if row is None:
+        session.add(PlatformSetting(key=key, value=value))
+    else:
+        row.value = value
+        row.updated_at = utcnow()
+
+
+@router.get("/settings")
+async def read_settings(session: SessionDep, _: UserDep) -> dict:
+    """Everything the global settings page's General/Channels/Agents tabs
+    render, in one call. Agent connection status is derived from whichever
+    DronaHQ webhook URL each agent key resolves to (config/.env), not stored."""
+    company = await _get_setting(session, "company_name")
+    timezone_ = await _get_setting(session, "timezone")
+    working_hours = await _get_setting(session, "working_hours")
+    working_days = await _get_setting(session, "working_days")
+    daily_cap = await _get_setting(session, "global_daily_send_cap")
+    dry_run = await _get_setting(session, "dry_run")
+    channels = await _get_setting(session, "channels")
+
+    agents: dict[str, dict] = {}
+    for agent_key in AGENT_ID_SETTINGS:
+        url = resolve_dronahq_agent_id(agent_key)
+        agents[agent_key] = {
+            "webhook_url": url,
+            "status": "connected" if url else "disconnected",
+            "last_ping": None,
+        }
+
+    return {
+        "company_name": (company or {}).get("value", "Atlas SDR"),
+        "timezone": (timezone_ or {}).get("value", "Asia/Kolkata"),
+        "working_hours": working_hours or {"start": "09:00", "end": "18:00"},
+        "working_days": (working_days or {}).get("days", ["mon", "tue", "wed", "thu", "fri"]),
+        "global_daily_limit": (daily_cap or {}).get("value", 500),
+        "dry_run": bool((dry_run or {}).get("value", settings.CHANNELS_DRY_RUN)),
+        "channels": channels or _SETTINGS_DEFAULTS["channels"],
+        "agents": agents,
+    }
+
+
+class GeneralSettingsUpdate(BaseModel):
+    company_name: Optional[str] = Field(default=None, max_length=200)
+    timezone: Optional[str] = Field(default=None, max_length=64)
+    working_hours: Optional[dict[str, Any]] = None
+    working_days: Optional[list[str]] = None
+    global_daily_limit: Optional[int] = Field(default=None, ge=1, le=100_000)
+    dry_run: Optional[bool] = None
+
+
+@router.put("/settings")
+async def write_settings(
+    body: GeneralSettingsUpdate, session: SessionDep, user: UserDep
+) -> dict:
+    """Save the General tab. Every field is optional so the page can PUT its
+    whole form without the caller having to know which fields changed."""
+    changes = body.model_dump(exclude_unset=True)
+    if "company_name" in changes:
+        await _put_setting(session, "company_name", {"value": changes["company_name"]})
+    if "timezone" in changes:
+        await _put_setting(session, "timezone", {"value": changes["timezone"]})
+    if "working_hours" in changes:
+        await _put_setting(session, "working_hours", changes["working_hours"])
+    if "working_days" in changes:
+        await _put_setting(session, "working_days", {"days": changes["working_days"]})
+    if "global_daily_limit" in changes:
+        await _put_setting(session, "global_daily_send_cap", {"value": changes["global_daily_limit"]})
+    if "dry_run" in changes:
+        await _put_setting(session, "dry_run", {"value": changes["dry_run"]})
+
+    await audit.record(
+        session,
+        entity_type="platform",
+        entity_id="settings",
+        event_type="settings_updated",
+        severity="info",
+        message=f"platform settings updated by {actor(user)}: {', '.join(sorted(changes)) or 'no fields'}.",
+        actor=actor(user),
+        payload={"fields": sorted(changes)},
+    )
+    await session.commit()
+    return {"ok": True}
+
+
+class ChannelSettingsUpdate(BaseModel):
+    email: Optional[dict[str, Any]] = None
+    sms: Optional[dict[str, Any]] = None
+    linkedin: Optional[dict[str, Any]] = None
+
+
+@router.put("/settings/channels")
+async def write_channel_settings(
+    body: ChannelSettingsUpdate, session: SessionDep, user: UserDep
+) -> dict:
+    """Save the Channels tab. Merges into the stored ``channels`` blob rather
+    than replacing it, so saving the email form doesn't blank out the SMS
+    number nobody touched this time.
+
+    Provider API keys (SendGrid, Twilio) are accepted here but never echoed
+    back by ``GET /settings`` — same secret-hygiene rule as
+    ``/platform/settings``. They're recorded as "configured" only; wiring a
+    key through to actually change ``SENDGRID_API_KEY``/``TWILIO_*`` at
+    runtime needs a process restart (they're read once at startup), so this
+    endpoint stores the non-secret parts and flags the secret ones for the
+    deployment's environment variables instead of pretending to hot-swap them.
+    """
+    current = (await _get_setting(session, "channels")) or _SETTINGS_DEFAULTS["channels"]
+    merged = dict(current)
+    changes = body.model_dump(exclude_unset=True)
+    for channel, fields in changes.items():
+        if fields is None:
+            continue
+        existing = dict(merged.get(channel) or {})
+        # Strip secret fields before persisting; they belong in env vars.
+        safe_fields = {k: v for k, v in fields.items() if k not in {"api_key", "auth_token"}}
+        existing.update(safe_fields)
+        merged[channel] = existing
+
+    await _put_setting(session, "channels", merged)
+
+    await audit.record(
+        session,
+        entity_type="platform",
+        entity_id="settings.channels",
+        event_type="channel_settings_updated",
+        severity="info",
+        message=f"channel settings updated by {actor(user)}: {', '.join(sorted(changes)) or 'no fields'}.",
+        actor=actor(user),
+        payload={"fields": sorted(changes)},
+    )
+    await session.commit()
+    return {"ok": True}
+
+
+@router.post("/settings/agents/{agent_key}/test")
+async def test_agent_webhook(agent_key: str, _: UserDep) -> dict:
+    """Ping this agent's configured DronaHQ webhook and report round-trip
+    latency, so a manager can tell "wired up" from "wired up and reachable"
+    before trusting it in a live campaign."""
+    if agent_key not in AGENT_ID_SETTINGS:
+        raise invalid_request(
+            f"{agent_key!r} is not a known agent. Choose one of: {', '.join(AGENT_ID_SETTINGS)}"
+        )
+    url = resolve_dronahq_agent_id(agent_key)
+    if not url:
+        raise ApiError(
+            422,
+            "not_configured",
+            f"No webhook URL is configured for {AGENT_LABELS.get(agent_key, agent_key)}. "
+            f"Set {AGENT_ID_SETTINGS[agent_key]} in the environment.",
+        )
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                url,
+                json={"ping": True, "agent_key": agent_key},
+                headers={"Authorization": f"Bearer {settings.DRONAHQ_API_KEY}"} if settings.DRONAHQ_API_KEY else {},
+            )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if response.status_code >= 400:
+            raise ApiError(
+                502,
+                "webhook_error",
+                f"Webhook responded with HTTP {response.status_code} after {latency_ms}ms.",
+            )
+        return {"status": "ok", "latency_ms": latency_ms}
+    except ApiError:
+        raise
+    except httpx.HTTPError as exc:
+        latency_ms = int((time.monotonic() - started) * 1000)
+        raise ApiError(
+            502,
+            "webhook_unreachable",
+            f"Could not reach the webhook after {latency_ms}ms: {exc}",
+        )
 
 
 __all__ = ["router"]

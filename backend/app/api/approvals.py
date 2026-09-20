@@ -116,7 +116,7 @@ def _assert_pending(approval: Approval) -> None:
 
 @router.post("/approvals/{approval_id}/approve")
 async def approve(
-    approval_id: str, body: DecisionRequest, session: SessionDep, user: UserDep
+    approval_id: str, session: SessionDep, user: UserDep, body: DecisionRequest = DecisionRequest()
 ) -> dict:
     """Approve, and act on it.
 
@@ -183,7 +183,7 @@ async def approve(
 
 @router.post("/approvals/{approval_id}/reject")
 async def reject(
-    approval_id: str, body: DecisionRequest, session: SessionDep, user: UserDep
+    approval_id: str, session: SessionDep, user: UserDep, body: DecisionRequest = DecisionRequest()
 ) -> dict:
     """Reject.
 

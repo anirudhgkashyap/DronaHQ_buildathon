@@ -1,3 +1,6 @@
+# Single service: FastAPI serves both the /api/v1/* backend AND the static
+# frontend (main.py mounts ../front_end at "/"). One Render URL runs the whole
+# app — no separate static site, no CORS/API-URL wiring needed.
 services:
   - type: web
     name: atlas-sdr-backend
@@ -6,7 +9,7 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
     envVars:
       - key: DATABASE_URL
-        value: sqlite+aiosqlite:///./atlas.db
+        value: sqlite+aiosqlite:///./atlas_sdr.db
       - key: ENV
         value: production
       - key: CHANNELS_DRY_RUN
@@ -15,5 +18,5 @@ services:
         value: "true"
       - key: CORS_ORIGINS
         value: "*"
-      # Add your DronaHQ creds in the Render dashboard:
+      # Add your DronaHQ credentials in the Render dashboard:
       # DRONAHQ_BASE_URL, DRONAHQ_API_KEY, DRONAHQ_AGENT_*

@@ -324,4 +324,67 @@ async def diff_versions(
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Global prompt library (the settings page's Prompts tab)
+# ---------------------------------------------------------------------------
+# Prompts are scoped to a campaign in the documented API (above): tuning one
+# campaign's agent cannot change another's behaviour. The settings page,
+# though, wants one flat library across every campaign to browse and activate
+# from — so this lists every agent-level version (the campaign system prompt
+# slot is excluded; it isn't a per-agent behaviour) across all campaigns, and
+# activation resolves the version by id rather than by (campaign, agent,
+# version) since that's what a flat list can address.
+@router.get("/prompts")
+async def list_all_prompts(session: SessionDep, _: UserDep, limit: Annotated[int, Query(ge=1, le=500)] = 100) -> dict:
+    versions = (
+        await session.execute(
+            select(PromptVersion)
+            .where(PromptVersion.agent_key != CAMPAIGN_PROMPT_KEY)
+            .order_by(PromptVersion.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": v.id,
+                "campaign_id": v.campaign_id,
+                "agent": v.agent_key,
+                "version": v.version,
+                "active": v.is_active,
+                "created_at": iso(v.created_at),
+                "preview": v.content[:200],
+            }
+            for v in versions
+        ]
+    }
+
+
+@router.post("/prompts/{version_id}/activate")
+async def activate_prompt_by_id(version_id: str, session: SessionDep, user: UserDep) -> dict:
+    """Activate a version addressed directly by id — the flat library's
+    equivalent of the campaign-scoped ``.../prompts/{agent_key}/{version}/activate``."""
+    target = await session.get(PromptVersion, version_id)
+    if target is None:
+        raise not_found("prompt version", version_id)
+
+    await _activate(session, target.campaign_id, target.agent_key, target)
+
+    label = PROMPT_LABELS.get(target.agent_key, target.agent_key)
+    await audit.record(
+        session,
+        entity_type="prompt_version",
+        entity_id=target.id,
+        event_type="prompt_version_activated",
+        severity="success",
+        message=f"prompt v{target.version} activated for the {label} by {actor(user)}.",
+        campaign_id=target.campaign_id,
+        actor=actor(user),
+        payload={"agent_key": target.agent_key, "version": target.version},
+    )
+    await session.commit()
+    return serialize_prompt_version(target)
+
+
 __all__ = ["router", "CAMPAIGN_PROMPT_KEY", "PROMPT_KEYS"]

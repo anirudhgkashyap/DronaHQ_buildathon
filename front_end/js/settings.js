@@ -8,9 +8,9 @@
     { id: "prospect_generation", name: "Prospect Generation Agent", description: "Finds and deduplicates new prospects matching the ICP from Apollo, LinkedIn, and other data sources." },
     { id: "research_enrichment", name: "Research & Enrichment Agent", description: "Enriches prospects with firmographic data, social signals, and recent news via Perplexity and Clearbit." },
     { id: "icp_fit",             name: "ICP Fit Agent",              description: "Scores prospects 0–100 against the campaign ICP definition and filters by threshold." },
-    { id: "outreach_strategist", name: "Outreach Strategist Agent",  description: "Decides which prospects to contact, the channel order, and timing. Routes to human approval when needed." },
+    { id: "outreach_strategy",   name: "Outreach Strategy Agent",    description: "Decides which prospects to contact, the channel order, and timing. Routes to human approval when needed." },
     { id: "personalisation",     name: "Personalisation Agent",      description: "Generates hyper-personalised email/SMS/LinkedIn copy using RAG, prospect signals, and the active prompt." },
-    { id: "reply_handler",       name: "Reply Handler Agent",        description: "Classifies inbound replies (interested / objection / unsubscribe / OOO) and generates follow-up actions." }
+    { id: "conversation",        name: "Conversation Agent",         description: "Classifies inbound replies (interested / objection / unsubscribe / OOO) and generates follow-up actions." }
   ];
 
   /* ---- mock ---- */
@@ -57,7 +57,7 @@
         return { items: [
           { id: "pv_1", agent: "personalisation", version: 6, active: true, created_at: new Date(Date.now()-200*60000).toISOString(), preview: "You are a world-class B2B SDR. Write a hyper-personalised outreach email for {{first_name}}…" },
           { id: "pv_2", agent: "personalisation", version: 5, active: false, created_at: new Date(Date.now()-2880*60000).toISOString(), preview: "You are a B2B SDR. Your goal is to book a meeting with {{first_name}} at {{company}}…" },
-          { id: "pv_3", agent: "reply_handler", version: 3, active: true, created_at: new Date(Date.now()-480*60000).toISOString(), preview: "Classify this inbound reply as one of: interested, objection, unsubscribe, out_of_office, other." }
+          { id: "pv_3", agent: "conversation", version: 3, active: true, created_at: new Date(Date.now()-480*60000).toISOString(), preview: "Classify this inbound reply as one of: interested, objection, unsubscribe, out_of_office, other." }
         ]};
       }
 
